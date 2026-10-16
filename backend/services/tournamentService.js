@@ -293,6 +293,23 @@ class TournamentService {
 	}
 
 	/**
+	 * Generate the next Swiss round without repeating an opponent. Players are
+	 * ordered by score, then rating, then wallet address for deterministic ties.
+	 * A colour preference is chosen from each player's previous colour balance.
+	 * The lowest-ranked player who has not received a bye gets the odd-player bye.
+	 */
+	async generateSwissRoundPairings(tournamentId, roundNumber) {
+		if (!Number.isInteger(roundNumber) || roundNumber < 1) {
+			throw new Error("roundNumber must be a positive integer");
+		}
+		const [participants, matches] = await Promise.all([
+			tournamentModel.getParticipants(tournamentId),
+			tournamentModel.getBracketMatches(tournamentId),
+		]);
+		return pairSwissRound(participants || [], matches || [], roundNumber);
+	}
+
+	/**
 	 * Build hierarchical round-by-round bracket tree for tournament visualization.
 	 * @param {string} tournamentId
 	 * @returns {Promise<object>} { totalRounds, rounds }
@@ -352,6 +369,47 @@ class TournamentService {
 	}
 }
 
+function pairSwissRound(players, previousMatches, roundNumber) {
+	const history = new Map();
+	const colours = new Map();
+	for (const match of previousMatches) {
+		const a = match.player_one || match.player1_address;
+		const b = match.player_two || match.player2_address;
+		if (a && b) {
+			if (!history.has(a)) history.set(a, new Set());
+			if (!history.has(b)) history.set(b, new Set());
+			history.get(a).add(b);
+			history.get(b).add(a);
+		}
+		if (match.player_white) colours.set(match.player_white, (colours.get(match.player_white) || 0) + 1);
+		if (match.player_black) colours.set(match.player_black, (colours.get(match.player_black) || 0) - 1);
+	}
+	const ranked = players.filter((p) => p && (p.wallet_address || p.walletAddress))
+		.map((p) => ({ ...p, wallet_address: p.wallet_address || p.walletAddress, score: Number(p.score || 0), elo: Number(p.elo || p.rating || 1200) }))
+		.sort((a, b) => b.score - a.score || b.elo - a.elo || a.wallet_address.localeCompare(b.wallet_address));
+	const pairings = [];
+	let bye = null;
+	if (ranked.length % 2 === 1) {
+		for (let i = ranked.length - 1; i >= 0; i -= 1) {
+			const candidate = ranked[i];
+			const hasBye = previousMatches.some((m) => m.status === "bye" && (m.winner || m.player_one || m.player_two) === candidate.wallet_address);
+			if (!hasBye) { bye = { walletAddress: candidate.wallet_address, round: roundNumber, status: "bye" }; ranked.splice(i, 1); break; }
+		}
+	}
+	while (ranked.length) {
+		const player = ranked.shift();
+		const opponentIndex = ranked.findIndex((candidate) => !(history.get(player.wallet_address) || new Set()).has(candidate.wallet_address));
+		if (opponentIndex === -1) throw new Error(`Unable to find a non-rematch opponent for ${player.wallet_address}`);
+		const opponent = ranked.splice(opponentIndex, 1)[0];
+		const playerBalance = colours.get(player.wallet_address) || 0;
+		const opponentBalance = colours.get(opponent.wallet_address) || 0;
+		const white = playerBalance <= opponentBalance ? player.wallet_address : opponent.wallet_address;
+		const black = white === player.wallet_address ? opponent.wallet_address : player.wallet_address;
+		pairings.push({ round: roundNumber, player_one: white, player_two: black, player_white: white, player_black: black, status: "ready" });
+	}
+	return { round: roundNumber, pairings, bye };
+}
+
 function broadcastTournamentEvent(io, tournamentId, eventName, payload) {
 	if (!io) return;
 	io.to(`tournament:${tournamentId}`).emit(eventName, {
@@ -382,6 +440,7 @@ function emitTournamentCompleted(io, tournamentId, payload) {
 }
 
 const tournamentService = new TournamentService();
+tournamentService.__pairSwissRoundForTest = pairSwissRound;
 tournamentService.broadcastTournamentEvent = broadcastTournamentEvent;
 tournamentService.emitPlayerJoined = emitPlayerJoined;
 tournamentService.emitBracketGenerated = emitBracketGenerated;

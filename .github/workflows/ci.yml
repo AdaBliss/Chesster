@@ -261,3 +261,39 @@ jobs:
           format: 'table'
           severity: 'CRITICAL'
           exit-code: '1'
+
+  dependency-security-audit:
+    name: Dependency Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: '**/pnpm-lock.yaml'
+
+      - name: Install root dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit root dependencies
+        run: pnpm audit --audit-level high --prod
+
+      - name: Audit backend dependencies
+        working-directory: backend
+        run: pnpm install --frozen-lockfile && pnpm audit --audit-level high --prod
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Soroban dependencies
+        run: cargo audit --file contracts/soroban/Cargo.lock
