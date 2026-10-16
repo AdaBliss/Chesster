@@ -12,6 +12,8 @@ pub const STORAGE_TTL_EXTENDED: u32 = 518_400;
 pub const DISPUTE_TIMELOCK_SECS: u64 = 172_800;
 /// Maximum number of matches resolvable in a single atomic batch transaction.
 pub const MAX_BATCH_RESOLUTIONS: u32 = 10;
+/// Maximum number of expired waiting lobbies refundable in one transaction (Issue #503).
+pub const MAX_BATCH_REFUNDS: u32 = 10;
 /// Duration (in seconds) after which settled or refunded matches become eligible for garbage collection (30 days).
 pub const STALE_MATCH_THRESHOLD_SECS: u64 = 2_592_000;
 /// Maximum number of game codes allowed in a single stale match garbage collection batch (Issue #380).
@@ -514,6 +516,8 @@ pub struct AssetConfig {
     pub max_wager: i128,
     /// Protocol fee tier in basis points for matches wagered in this asset.
     pub fee_bps: u32,
+    /// Registered asset precision. Wager bounds and aggregate accounting use seven decimals.
+    pub decimals: u32,
     /// Whether matches may currently be created using this asset.
     pub enabled: bool,
 }
@@ -527,7 +531,16 @@ pub struct AssetConfigUpdatedEvent {
     pub min_wager: i128,
     pub max_wager: i128,
     pub fee_bps: u32,
+    pub decimals: u32,
     pub enabled: bool,
+}
+
+/// Published after a batch of expired waiting lobbies is refunded (Issue #503).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRefundedEvent {
+    pub count: u32,
+    pub game_codes: Vec<String>,
 }
 
 #[contracttype]
@@ -797,6 +810,8 @@ pub enum DataKey {
     DrainSchedule,
     /// Per-asset wager limits, fee tier, and enablement flag (Issue #431).
     AssetConfig(Address),
+    /// Decimal precision recorded when a wager token is whitelisted (Issue #504).
+    AssetDecimals(Address),
     /// Cumulative protocol fees collected for a token.
     TotalFeesCollected(Address),
 }
@@ -2130,7 +2145,23 @@ impl ChessterEscrow {
         let coordinator = Self::get_coordinator(env.clone());
         coordinator.require_auth();
 
-        let key = Self::whitelist_key(&env);
+        Self::add_whitelisted_token_with_decimals_internal(&env, token, 7);
+    }
+
+    /// Admin-gated: whitelist a wager token and record its decimal precision (Issue #504).
+    pub fn add_whitelisted_token_decimals(env: Env, token: Address, decimals: u32) {
+        let coordinator = Self::get_coordinator(env.clone());
+        coordinator.require_auth();
+
+        Self::add_whitelisted_token_with_decimals_internal(&env, token, decimals);
+    }
+
+    fn add_whitelisted_token_with_decimals_internal(env: &Env, token: Address, decimals: u32) {
+        if decimals > 18 {
+            panic_with_error!(env, EscrowError::InvalidWager);
+        }
+
+        let key = Self::whitelist_key(env);
         let mut tokens: Vec<Address> = env
             .storage()
             .instance()
@@ -2138,14 +2169,18 @@ impl ChessterEscrow {
             .unwrap_or_else(|| Vec::new(&env));
 
         if tokens.contains(&token) {
-            panic_with_error!(&env, EscrowError::TokenAlreadyWhitelisted);
+            panic_with_error!(env, EscrowError::TokenAlreadyWhitelisted);
         }
 
         tokens.push_back(token.clone());
         env.storage().instance().set(&key, &tokens);
         env.storage()
             .instance()
-            .set(&(Symbol::new(&env, "sup_tok"), token), &true);
+            .set(&(Symbol::new(env, "sup_tok"), token.clone()), &true);
+
+        let decimals_key = DataKey::AssetDecimals(token);
+        env.storage().persistent().set(&decimals_key, &decimals);
+        Self::bump_entry_ttl(env, &decimals_key);
     }
 
     /// Admin-gated: remove a token from the wager-asset whitelist (Issue #40).
@@ -2173,7 +2208,10 @@ impl ChessterEscrow {
         env.storage().instance().set(&key, &filtered);
         env.storage()
             .instance()
-            .remove(&(Symbol::new(&env, "sup_tok"), token));
+            .remove(&(Symbol::new(&env, "sup_tok"), token.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AssetDecimals(token));
     }
 
     /// Whether a token is currently whitelisted as a supported wager asset (Issue #40).
@@ -2336,22 +2374,81 @@ impl ChessterEscrow {
             if !config.enabled {
                 panic_with_error!(env, EscrowError::TokenNotWhitelisted);
             }
-            if amount < config.min_wager {
+            let decimals = Self::asset_decimals(env, token);
+            let normalized_amount = Self::normalize_wager(env, amount, decimals);
+            if normalized_amount < config.min_wager {
                 panic_with_error!(env, EscrowError::WagerBelowMinimum);
             }
-            if amount > config.max_wager {
+            if normalized_amount > config.max_wager {
                 panic_with_error!(env, EscrowError::WagerAboveMaximum);
             }
             return;
         }
 
+        let decimals = Self::asset_decimals(env, token);
+        let normalized_amount = Self::normalize_wager(env, amount, decimals);
         let limits = Self::get_token_wager_limits(env.clone(), token.clone());
-        if amount < limits.min_wager {
+        if normalized_amount < limits.min_wager {
             panic_with_error!(env, EscrowError::WagerBelowMinimum);
         }
-        if amount > limits.max_wager {
+        if normalized_amount > limits.max_wager {
             panic_with_error!(env, EscrowError::WagerAboveMaximum);
         }
+    }
+
+    /// Converts native token units to the contract's seven-decimal accounting unit.
+    fn normalize_wager(env: &Env, amount: i128, decimals: u32) -> i128 {
+        if decimals > 18 {
+            panic_with_error!(env, EscrowError::InvalidWager);
+        }
+        if decimals == 7 {
+            return amount;
+        }
+
+        let exponent = if decimals < 7 {
+            7 - decimals
+        } else {
+            decimals - 7
+        };
+        let factor = 10_i128
+            .checked_pow(exponent)
+            .unwrap_or_else(|| panic_with_error!(env, EscrowError::InvalidWager));
+        if decimals < 7 {
+            amount
+                .checked_mul(factor)
+                .unwrap_or_else(|| panic_with_error!(env, EscrowError::InvalidWager))
+        } else {
+            amount / factor
+        }
+    }
+
+    /// Converts a seven-decimal accounting amount back to native token units.
+    fn denormalize_wager(env: &Env, amount: i128, decimals: u32) -> i128 {
+        if decimals == 7 {
+            return amount;
+        }
+        let exponent = if decimals < 7 {
+            7 - decimals
+        } else {
+            decimals - 7
+        };
+        let factor = 10_i128
+            .checked_pow(exponent)
+            .unwrap_or_else(|| panic_with_error!(env, EscrowError::InvalidWager));
+        if decimals < 7 {
+            amount / factor
+        } else {
+            amount
+                .checked_mul(factor)
+                .unwrap_or_else(|| panic_with_error!(env, EscrowError::InvalidWager))
+        }
+    }
+
+    fn normalized_fee(env: &Env, token: &Address, amount: i128, fee_bps: u32) -> i128 {
+        let decimals = Self::asset_decimals(env, token);
+        let normalized_amount = Self::normalize_wager(env, amount, decimals);
+        let fee = checked_mul_div(env, normalized_amount, fee_bps as i128, 10_000);
+        Self::denormalize_wager(env, fee, decimals)
     }
 
     /// Registers or updates the whitelist/fee/limit configuration for a wager
@@ -2363,7 +2460,7 @@ impl ChessterEscrow {
 
         // Reuses InvalidWager, mirroring the existing set_fee_bps convention,
         // since EscrowError has no spare case slots (see the comment above).
-        if config.fee_bps > MAX_ASSET_FEE_BPS {
+        if config.fee_bps > MAX_ASSET_FEE_BPS || config.decimals > 18 {
             panic_with_error!(&env, EscrowError::InvalidWager);
         }
         if config.min_wager <= 0 || config.max_wager < config.min_wager {
@@ -2373,6 +2470,11 @@ impl ChessterEscrow {
         let key = DataKey::AssetConfig(token.clone());
         env.storage().persistent().set(&key, &config);
         Self::bump_entry_ttl(&env, &key);
+        let decimals_key = DataKey::AssetDecimals(token.clone());
+        env.storage()
+            .persistent()
+            .set(&decimals_key, &config.decimals);
+        Self::bump_entry_ttl(&env, &decimals_key);
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
@@ -2382,6 +2484,7 @@ impl ChessterEscrow {
                 min_wager: config.min_wager,
                 max_wager: config.max_wager,
                 fee_bps: config.fee_bps,
+                decimals: config.decimals,
                 enabled: config.enabled,
             },
         );
@@ -2395,6 +2498,27 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &key);
         }
         config
+    }
+
+    /// Returns the registered token precision, defaulting to seven decimals (Issue #504).
+    pub fn get_asset_decimals(env: Env, token: Address) -> u32 {
+        let key = DataKey::AssetDecimals(token);
+        let decimals = env.storage().persistent().get(&key).unwrap_or(7);
+        if env.storage().persistent().has(&key) {
+            Self::bump_entry_ttl(&env, &key);
+        }
+        decimals
+    }
+
+    fn asset_decimals(env: &Env, token: &Address) -> u32 {
+        let key = DataKey::AssetDecimals(token.clone());
+        if let Some(decimals) = env.storage().persistent().get(&key) {
+            Self::bump_entry_ttl(env, &key);
+            return decimals;
+        }
+        Self::get_asset_config(env.clone(), token.clone())
+            .map(|config| config.decimals)
+            .unwrap_or(7)
     }
 
     /// Creates a match and deposits Player 1's wager with default expiration duration (Issue #34).
@@ -2518,7 +2642,8 @@ impl ChessterEscrow {
             });
         metrics.total_matches_created += 1;
         metrics.active_matches_count += 1;
-        metrics.total_volume_xlm += amount;
+        let decimals = Self::asset_decimals(&env, &token);
+        metrics.total_volume_xlm += Self::normalize_wager(&env, amount, decimals);
         env.storage().persistent().set(&DataKey::Metrics, &metrics);
         Self::bump_entry_ttl(&env, &DataKey::Metrics);
 
@@ -2619,7 +2744,8 @@ impl ChessterEscrow {
                 total_volume_xlm: 0,
                 total_rake_collected: 0,
             });
-        metrics.total_volume_xlm += m.wager_amount;
+        let decimals = Self::asset_decimals(&env, &m.token);
+        metrics.total_volume_xlm += Self::normalize_wager(&env, m.wager_amount, decimals);
         env.storage().persistent().set(&DataKey::Metrics, &metrics);
         Self::bump_entry_ttl(&env, &DataKey::Metrics);
 
@@ -3223,7 +3349,7 @@ impl ChessterEscrow {
         // a window where the match still looks unresolved. ---
         let admin_fee: i128 = if let Some(ref w) = winner {
             let admin_bps = Self::get_effective_fee_bps(env.clone(), w.clone());
-            checked_mul_div(env, m.total_staked, admin_bps as i128, 10000)
+            Self::normalized_fee(env, &m.token, m.total_staked, admin_bps)
         } else {
             0
         };
@@ -3545,6 +3671,51 @@ impl ChessterEscrow {
         count
     }
 
+    /// Atomically refunds up to ten expired matches that are still waiting for a second player.
+    /// Every entry is validated before any refund is executed, so one invalid entry aborts the
+    /// whole batch (Issue #503).
+    pub fn batch_refund_expired(env: Env, game_codes: Vec<String>) -> u32 {
+        let _guard = ReentrancyGuard::new(&env);
+        let coordinator = Self::get_coordinator(env.clone());
+        coordinator.require_auth();
+
+        if game_codes.is_empty() || game_codes.len() > MAX_BATCH_REFUNDS {
+            panic_with_error!(&env, EscrowError::InvalidBatchSize);
+        }
+
+        let now = env.ledger().timestamp();
+        for game_code in game_codes.iter() {
+            let m: Match = env
+                .storage()
+                .persistent()
+                .get(&game_code)
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::MatchNotFound));
+            if m.status != MatchStatus::Pending || m.player2.is_some() {
+                panic_with_error!(&env, EscrowError::MatchNotPending);
+            }
+            let timeout = if m.max_duration_seconds > 0 {
+                m.max_duration_seconds
+            } else {
+                Self::get_match_timeout(env.clone())
+            };
+            if now < m.created_at + timeout {
+                panic_with_error!(&env, EscrowError::TimeoutNotReached);
+            }
+        }
+
+        for game_code in game_codes.iter() {
+            let mut m = Self::load_match(&env, &game_code);
+            Self::execute_refund(&env, &game_code, &mut m);
+        }
+
+        let count = game_codes.len();
+        env.events().publish(
+            (Symbol::new(&env, "batch_refunded"),),
+            BatchRefundedEvent { count, game_codes },
+        );
+        count
+    }
+
     /// Refunds match wagers after match expiration timeout period.
     ///
     /// # Arguments
@@ -3723,7 +3894,8 @@ impl ChessterEscrow {
                     total_volume_xlm: 0,
                     total_rake_collected: 0,
                 });
-            metrics.total_volume_xlm += amount;
+            let decimals = Self::asset_decimals(&env, &m.token);
+            metrics.total_volume_xlm += Self::normalize_wager(&env, amount, decimals);
             env.storage().persistent().set(&DataKey::Metrics, &metrics);
             Self::bump_entry_ttl(&env, &DataKey::Metrics);
 
@@ -3829,7 +4001,8 @@ impl ChessterEscrow {
                 });
             metrics.total_matches_created += 1;
             metrics.active_matches_count += 1;
-            metrics.total_volume_xlm += amount;
+            let decimals = Self::asset_decimals(&env, &token);
+            metrics.total_volume_xlm += Self::normalize_wager(&env, amount, decimals);
             env.storage().persistent().set(&DataKey::Metrics, &metrics);
             Self::bump_entry_ttl(&env, &DataKey::Metrics);
 
@@ -4118,6 +4291,20 @@ impl ChessterEscrow {
     /// * `Match` - Match struct details.
     pub fn get_match(env: Env, game_code: String) -> Match {
         Self::load_match(&env, &game_code)
+    }
+
+    /// Returns the active match codes indexed for a player (Issue #505).
+    pub fn get_player_active_matches(env: Env, player: Address) -> Vec<String> {
+        let key = (Symbol::new(&env, "act_m"), player);
+        let matches = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            Self::bump_entry_ttl(&env, &key);
+        }
+        matches
     }
 
     /// Extends the persistent storage and instance TTL for a match record to prevent ledger eviction (Issue #29).
