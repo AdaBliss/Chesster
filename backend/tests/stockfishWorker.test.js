@@ -121,6 +121,24 @@ describe("stockfishWorker move handler", () => {
 		expect(second.fallbackReason).toBe("engine unavailable");
 	});
 
+	it("keeps returning legal fallback moves while the binary cooldown is active", async () => {
+		handler = createMoveHandler({ enginePath: "missing-stockfish-binary" });
+
+		const first = await handler.computeMove(task());
+		const second = await handler.computeMove(task({ turn: "black" }));
+
+		expect(first.engine).toBe("heuristic");
+		expect(second.engine).toBe("heuristic");
+		expect(second.fallbackReason).toBe("engine unavailable");
+		expect(chessEngine.isValidMove(
+			chessEngine.initBoard(),
+			second.move.from,
+			second.move.to,
+			"black",
+			null,
+		).valid).toBe(true);
+	});
+
 	it("uses the heuristic directly when no engine is configured", async () => {
 		handler = createMoveHandler({ enginePath: null });
 
