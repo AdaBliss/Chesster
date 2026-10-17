@@ -38,6 +38,8 @@ pub const DEFAULT_MAX_WAGER: i128 = i128::MAX;
 pub const MAX_TOURNAMENT_FEE_BPS: u32 = 500;
 /// Upper bound on a per-asset protocol fee tier configured via `AssetConfig` (Issue #431).
 pub const MAX_ASSET_FEE_BPS: u32 = 1_000;
+/// Upper bound on the protocol fee taken from a losing spectator side pool (Issue #459).
+pub const MAX_SIDE_BET_FEE_BPS: u32 = 500;
 /// Basis points denominator (10,000 bps = 100%) (Issue #221).
 pub const BPS_DENOMINATOR: i128 = 10_000;
 /// Mutual cancellation proposals expire after fifteen minutes.
@@ -148,10 +150,25 @@ pub enum EscrowError {
     CannotConfirmOwnProposal = 48,
     /// Caller is not an authorized participant in this match (Issue #290).
     UnauthorizedPlayer = 49,
+}
+
+/// Additional escrow errors. Soroban's contract spec caps a `#[contracterror]` enum at
+/// 50 cases and `EscrowError` is full, so new codes continue here from 50 upward.
+/// Codes are unique across both enums and must never be renumbered.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum EscrowErrorExt {
     /// Mutual cancellation proposal is older than the confirmation window.
     ProposalExpired = 50,
     /// Arithmetic overflow occurred during tournament prize calculation (Issue #484).
     ArithmeticOverflow = 51,
+    /// Wager is below the minimum configured for this specific token (Issue #460).
+    WagerBelowTokenMinimum = 52,
+    /// Side bets cannot be claimed until the match is resolved or refunded (Issue #459).
+    SideBetsNotSettled = 54,
+    /// Side bet token differs from the match wager token (Issue #459).
+    SideBetTokenMismatch = 55,
 }
 
 /// Payload for player deposit authorization with nonce-based replay protection (Issue #284).
@@ -208,7 +225,86 @@ pub struct SideBet {
     pub amount: i128,
 }
 
-/// Spectator side bet pool for a match.
+/// Side of the board a spectator backs: White is `player1` (creator), Black is `player2`.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayerColor {
+    White = 0,
+    Black = 1,
+}
+
+/// Settlement state of a match's spectator side pool (Issue #459).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SideBetOutcome {
+    /// Match still running; bets may be placed until betting closes.
+    Open = 0,
+    /// White won: White bettors share the Black pool minus the protocol fee.
+    WhiteWon = 1,
+    /// Black won: Black bettors share the White pool minus the protocol fee.
+    BlackWon = 2,
+    /// Draw, refund, cancellation, or nobody backed the winner: every stake is returned in full.
+    Refund = 3,
+}
+
+/// Aggregate spectator side pool for a match (Issue #459). Individual stakes live under
+/// `DataKey::SideBetStake` so that placing, settling and claiming never iterate over bettors.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SideBetLedger {
+    pub game_code: String,
+    /// Match wager token; side bets are always placed in it.
+    pub token: Address,
+    pub total_white_bets: i128,
+    pub total_black_bets: i128,
+    pub outcome: SideBetOutcome,
+    /// Set by the coordinator (e.g. at move 10) to stop new bets on a live match.
+    pub betting_closed: bool,
+    /// Protocol fee taken from the losing pool at settlement.
+    pub fee_collected: i128,
+    /// Losing pool minus fee, shared pro rata by winning bettors.
+    pub distributable: i128,
+    /// Winning-side stake that has not been claimed yet.
+    pub unclaimed_winning_stake: i128,
+    /// Part of `distributable` not yet paid out; the last winning claim sweeps the rounding
+    /// remainder to the treasury.
+    pub unclaimed_profit: i128,
+    /// Tokens still held for this pool. The ledger may be removed once this reaches zero.
+    pub outstanding: i128,
+}
+
+/// Published when a spectator places a side bet (Issue #459).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SideBetPlacedEvent {
+    pub game_code: String,
+    pub bettor: Address,
+    pub color: PlayerColor,
+    pub amount: i128,
+}
+
+/// Published when a match's side pool is settled (Issue #459).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SideBetsSettledEvent {
+    pub game_code: String,
+    pub outcome: SideBetOutcome,
+    pub fee_collected: i128,
+}
+
+/// Published when a spectator claims a settled side bet (Issue #459).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SideBetClaimedEvent {
+    pub game_code: String,
+    pub bettor: Address,
+    pub payout: i128,
+    /// Rounding remainder sent to the treasury by the final winning claim.
+    pub treasury_remainder: i128,
+}
+
+/// Legacy spectator side bet pool for a match (Issue #35). No new bets are recorded here;
+/// pools created before the upgrade to `SideBetLedger` are still settled at match end.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SidePool {
@@ -758,13 +854,23 @@ pub const TOPIC_REFUNDED: Symbol = symbol_short!("refunded");
 
 /// Centralized event publishing helper to guarantee uniform indexing format across all match lifecycle transitions.
 pub fn emit_match_event(env: &Env, topic: Symbol, match_id: u64, data: Val) {
-    let topics = (Symbol::new(env, "v1"), symbol_short!("escrow"), topic, match_id);
+    let topics = (
+        Symbol::new(env, "v1"),
+        symbol_short!("escrow"),
+        topic,
+        match_id,
+    );
     env.events().publish(topics, data);
 }
 
 /// Centralized event publishing helper for match settlements.
 pub fn emit_match_settled(env: &Env, match_id: u64, winner: &Address, payout: i128, fee: i128) {
-    let topics = (Symbol::new(env, "v1"), symbol_short!("escrow"), symbol_short!("settled"), match_id);
+    let topics = (
+        Symbol::new(env, "v1"),
+        symbol_short!("escrow"),
+        symbol_short!("settled"),
+        match_id,
+    );
     let data = (winner.clone(), payout, fee);
     env.events().publish(topics, data);
 }
@@ -853,23 +959,23 @@ fn checked_mul_div(env: &Env, a: i128, b: i128, denom: i128) -> i128 {
 /// credited to ensure exact total payout (Issue #484).
 fn mul_div_bps(env: &Env, amount: i128, bps: u32) -> (i128, i128) {
     let bps_i128 = i128::from(bps);
-    
+
     // Decompose to avoid overflow: (a/b)*c + (a%b)*c/b
     let whole = (amount / BPS_DENOMINATOR)
         .checked_mul(bps_i128)
-        .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
-    
+        .unwrap_or_else(|| panic_with_error!(env, EscrowErrorExt::ArithmeticOverflow));
+
     let remainder_part = (amount % BPS_DENOMINATOR)
         .checked_mul(bps_i128)
-        .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
-    
+        .unwrap_or_else(|| panic_with_error!(env, EscrowErrorExt::ArithmeticOverflow));
+
     let fraction = remainder_part / BPS_DENOMINATOR;
     let residual = remainder_part % BPS_DENOMINATOR;
-    
+
     let quotient = whole
         .checked_add(fraction)
-        .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
-    
+        .unwrap_or_else(|| panic_with_error!(env, EscrowErrorExt::ArithmeticOverflow));
+
     (quotient, residual)
 }
 
@@ -923,6 +1029,12 @@ pub enum DataKey {
     AssetDecimals(Address),
     /// Cumulative protocol fees collected for a token.
     TotalFeesCollected(Address),
+    /// Spectator side pool for a match (Issue #459).
+    SideBetPool(String),
+    /// A spectator's stake on one side of a match (Issue #459).
+    SideBetStake(String, Address, PlayerColor),
+    /// Protocol fee (bps) taken from losing spectator side pools (Issue #459).
+    SideBetFeeBps,
 }
 
 /// Aggregated operational metrics for off-chain indexing and monitoring (Issue #288).
@@ -1005,7 +1117,7 @@ impl ChessterEscrow {
             .set(&Symbol::new(&env, "paused"), &true);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("paused"),),
+            (Symbol::new(&env, "v1"), symbol_short!("paused")),
             ContractPausedEvent { coordinator },
         );
     }
@@ -1022,7 +1134,7 @@ impl ChessterEscrow {
             .set(&Symbol::new(&env, "paused"), &false);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("unpause"),),
+            (Symbol::new(&env, "v1"), symbol_short!("unpause")),
             ContractUnpausedEvent { coordinator },
         );
     }
@@ -1075,7 +1187,7 @@ impl ChessterEscrow {
             .set(&Self::migration_key(&env), &true);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("mig_auth"),),
+            (Symbol::new(&env, "v1"), symbol_short!("mig_auth")),
             MigrationAuthorizedEvent { coordinator },
         );
     }
@@ -1093,7 +1205,7 @@ impl ChessterEscrow {
             .set(&Self::migration_key(&env), &false);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("mig_revk"),),
+            (Symbol::new(&env, "v1"), symbol_short!("mig_revk")),
             MigrationRevokedEvent { coordinator },
         );
     }
@@ -1173,7 +1285,11 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("emrg_drn"), token.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("emrg_drn"),
+                token.clone(),
+            ),
             EmergencyDrainEvent {
                 coordinator,
                 token,
@@ -1404,7 +1520,8 @@ impl ChessterEscrow {
         coordinator.require_auth();
 
         env.storage().persistent().remove(&DataKey::DrainSchedule);
-        env.events().publish((Symbol::new(&env, "v1"), symbol_short!("drain_can"),), ());
+        env.events()
+            .publish((Symbol::new(&env, "v1"), symbol_short!("drain_can")), ());
     }
 
     /// Executes a scheduled emergency drain after the 7-day timelock has expired (Issue #285).
@@ -1584,7 +1701,7 @@ impl ChessterEscrow {
         let (rake, _) = mul_div_bps(env, total_pool, fee_bps);
         let net_prize = total_pool
             .checked_sub(rake)
-            .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
+            .unwrap_or_else(|| panic_with_error!(env, EscrowErrorExt::ArithmeticOverflow));
         (net_prize, rake)
     }
 
@@ -1819,7 +1936,7 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &Self::pause_confirmations_key(&env));
 
         env.events().publish(
-            (symbol_short!("pause_prop"),),
+            (Symbol::new(&env, "pause_prop"),),
             PauseProposaledEvent {
                 proposer: admin,
                 proposed_at: now,
@@ -1841,7 +1958,7 @@ impl ChessterEscrow {
         }
 
         let pause_key = Self::pause_proposal_key(&env);
-        let mut proposal = env
+        let mut proposal: PauseProposal = env
             .storage()
             .persistent()
             .get(&pause_key)
@@ -1896,10 +2013,10 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &Self::pause_confirmations_key(&env));
 
             env.events().publish(
-                (symbol_short!("pause_conf"),),
+                (Symbol::new(&env, "pause_conf"),),
                 PauseConfirmedEvent {
                     confirmer: admin,
-                    confirmation_count: confirmations.len() as u32,
+                    confirmation_count: confirmations.len(),
                 },
             );
         }
@@ -1944,7 +2061,7 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &Self::unpause_confirmations_key(&env));
 
         env.events().publish(
-            (symbol_short!("unpause_prop"),),
+            (Symbol::new(&env, "unpause_prop"),),
             UnpauseProposaledEvent {
                 proposer: admin,
                 proposed_at: now,
@@ -1966,7 +2083,7 @@ impl ChessterEscrow {
         }
 
         let unpause_key = Self::unpause_proposal_key(&env);
-        let mut proposal = env
+        let mut proposal: UnpauseProposal = env
             .storage()
             .persistent()
             .get(&unpause_key)
@@ -2010,7 +2127,7 @@ impl ChessterEscrow {
             let admin2 = confirmations.get(1).unwrap();
 
             env.events().publish(
-                (symbol_short!("unpause_exe"),),
+                (Symbol::new(&env, "unpause_exe"),),
                 MultisigUnpauseExecutedEvent { admin1, admin2 },
             );
         } else {
@@ -2021,10 +2138,10 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &Self::unpause_confirmations_key(&env));
 
             env.events().publish(
-                (symbol_short!("unpause_conf"),),
+                (Symbol::new(&env, "unpause_conf"),),
                 UnpauseConfirmedEvent {
                     confirmer: admin,
-                    confirmation_count: confirmations.len() as u32,
+                    confirmation_count: confirmations.len(),
                 },
             );
         }
@@ -2230,7 +2347,7 @@ impl ChessterEscrow {
         }
         Self::record_rotation_approval(&env, &signer, &new_coordinator);
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("rot_prop"),),
+            (Symbol::new(&env, "v1"), symbol_short!("rot_prop")),
             CoordinatorRotationProposedEvent {
                 proposed_coordinator: new_coordinator,
             },
@@ -2289,7 +2406,7 @@ impl ChessterEscrow {
             env.storage().instance().remove(&key);
             Self::bump_instance_ttl(env);
             env.events().publish(
-                (Symbol::new(&env, "v1"), symbol_short!("rot_exec"),),
+                (Symbol::new(env, "v1"), symbol_short!("rot_exec")),
                 CoordinatorRotationExecutedEvent {
                     new_coordinator: new_coordinator.clone(),
                 },
@@ -2406,7 +2523,7 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(env);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("w_limits"),),
+            (Symbol::new(env, "v1"), symbol_short!("w_limits")),
             WagerLimitsUpdatedEvent {
                 min_wager,
                 max_wager,
@@ -2484,7 +2601,11 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(env);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("tok_wlim"), token.clone()),
+            (
+                Symbol::new(env, "v1"),
+                symbol_short!("tok_wlim"),
+                token.clone(),
+            ),
             TokenWagerLimitsUpdatedEvent {
                 token: token.clone(),
                 min_wager,
@@ -2518,12 +2639,8 @@ impl ChessterEscrow {
 
     /// Retrieves token-specific wager limits if configured, or falls back to global limits (Issue #23).
     pub fn get_token_wager_limits(env: Env, token: Address) -> WagerLimits {
-        let key = (Symbol::new(&env, "tok_wlim"), token);
-        if let Some(limits) = env.storage().instance().get(&key) {
-            limits
-        } else {
-            Self::get_wager_limits(env)
-        }
+        Self::configured_token_wager_limits(&env, &token)
+            .unwrap_or_else(|| Self::get_wager_limits(env))
     }
 
     /// Retrieves minimum allowable wager limit for specified token (Issue #23).
@@ -2622,7 +2739,7 @@ impl ChessterEscrow {
             .storage()
             .instance()
             .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
+            .unwrap_or_else(|| Vec::new(env));
 
         if tokens.contains(&token) {
             panic_with_error!(env, EscrowError::TokenAlreadyWhitelisted);
@@ -2820,32 +2937,53 @@ impl ChessterEscrow {
             panic_with_error!(env, EscrowError::InvalidWager);
         }
 
-        // When a per-asset AssetConfig is registered for this token (Issue #431),
-        // it is the authoritative source for enablement and wager bounds,
-        // superseding the legacy global/per-token wager limits below.
+        let decimals = Self::asset_decimals(env, token);
+        let normalized_amount = Self::normalize_wager(env, amount, decimals);
+        let token_limits = Self::configured_token_wager_limits(env, token);
+
+        // A per-asset AssetConfig (Issue #431) supersedes the global limits, but an
+        // explicitly configured per-token minimum/maximum must still hold (Issue #460).
         if let Some(config) = Self::get_asset_config(env.clone(), token.clone()) {
-            // EscrowError is already at the XDR contracterror case limit, so a
-            // disabled asset reuses TokenNotWhitelisted: both mean "this token
+            // A disabled asset reuses TokenNotWhitelisted: both mean "this token
             // cannot currently be wagered with".
             if !config.enabled {
                 panic_with_error!(env, EscrowError::TokenNotWhitelisted);
             }
-            let decimals = Self::asset_decimals(env, token);
-            let normalized_amount = Self::normalize_wager(env, amount, decimals);
             if normalized_amount < config.min_wager {
                 panic_with_error!(env, EscrowError::WagerBelowMinimum);
             }
             if normalized_amount > config.max_wager {
                 panic_with_error!(env, EscrowError::WagerAboveMaximum);
             }
+            if let Some(limits) = token_limits {
+                Self::enforce_token_wager_limits(env, normalized_amount, &limits);
+            }
             return;
         }
 
-        let decimals = Self::asset_decimals(env, token);
-        let normalized_amount = Self::normalize_wager(env, amount, decimals);
-        let limits = Self::get_token_wager_limits(env.clone(), token.clone());
+        if let Some(limits) = token_limits {
+            Self::enforce_token_wager_limits(env, normalized_amount, &limits);
+            return;
+        }
+
+        let limits = Self::get_wager_limits(env.clone());
         if normalized_amount < limits.min_wager {
             panic_with_error!(env, EscrowError::WagerBelowMinimum);
+        }
+        if normalized_amount > limits.max_wager {
+            panic_with_error!(env, EscrowError::WagerAboveMaximum);
+        }
+    }
+
+    /// Returns the limits set via `set_token_wager_limits`, without the global fallback.
+    fn configured_token_wager_limits(env: &Env, token: &Address) -> Option<WagerLimits> {
+        let key = (Symbol::new(env, "tok_wlim"), token.clone());
+        env.storage().instance().get(&key)
+    }
+
+    fn enforce_token_wager_limits(env: &Env, normalized_amount: i128, limits: &WagerLimits) {
+        if normalized_amount < limits.min_wager {
+            panic_with_error!(env, EscrowErrorExt::WagerBelowTokenMinimum);
         }
         if normalized_amount > limits.max_wager {
             panic_with_error!(env, EscrowError::WagerAboveMaximum);
@@ -2861,11 +2999,7 @@ impl ChessterEscrow {
             return amount;
         }
 
-        let exponent = if decimals < 7 {
-            7 - decimals
-        } else {
-            decimals - 7
-        };
+        let exponent = decimals.abs_diff(7);
         let factor = 10_i128
             .checked_pow(exponent)
             .unwrap_or_else(|| panic_with_error!(env, EscrowError::InvalidWager));
@@ -2883,11 +3017,7 @@ impl ChessterEscrow {
         if decimals == 7 {
             return amount;
         }
-        let exponent = if decimals < 7 {
-            7 - decimals
-        } else {
-            decimals - 7
-        };
+        let exponent = decimals.abs_diff(7);
         let factor = 10_i128
             .checked_pow(exponent)
             .unwrap_or_else(|| panic_with_error!(env, EscrowError::InvalidWager));
@@ -2934,7 +3064,11 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), Symbol::new(&env, "asset_config_updated"), token.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                Symbol::new(&env, "asset_config_updated"),
+                token.clone(),
+            ),
             AssetConfigUpdatedEvent {
                 token,
                 min_wager: config.min_wager,
@@ -3118,7 +3252,11 @@ impl ChessterEscrow {
             (player1.clone(), token.clone(), amount).into_val(&env),
         );
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("created"), game_code.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("created"),
+                game_code.clone(),
+            ),
             MatchCreatedEvent {
                 game_code,
                 player1,
@@ -3219,7 +3357,11 @@ impl ChessterEscrow {
             (player2.clone(), m.total_staked).into_val(&env),
         );
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("funded"), game_code.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("funded"),
+                game_code.clone(),
+            ),
             MatchFundedEvent {
                 game_code,
                 player2,
@@ -3229,26 +3371,28 @@ impl ChessterEscrow {
         release_reentrancy(&env);
     }
 
-    /// Places a spectator side bet on predicted match winner (Issue #35).
+    /// Places a spectator side bet backing one player of a match (Issues #35, #459).
+    ///
+    /// Stakes are segregated into White (`player1`) and Black (`player2`) pools and are
+    /// settled when the match ends; winnings are withdrawn with `claim_side_bet`.
     ///
     /// # Arguments
     /// * `env` - Environment reference.
     /// * `game_code` - Unique match game code.
-    /// * `spectator` - Spectator address placing bet.
-    /// * `predicted_winner` - Address of predicted winner.
-    /// * `amount` - Staked bet amount.
+    /// * `bettor` - Spectator placing the bet (players cannot bet on their own match).
+    /// * `chosen_player` - Player backed to win; must be `player1` or the joined `player2`.
+    /// * `token` - Must be the match wager token.
+    /// * `amount` - Stake, subject to the token's wager limits.
     pub fn place_side_bet(
         env: Env,
         game_code: String,
-        spectator: Address,
-        predicted_winner: Address,
+        bettor: Address,
+        chosen_player: Address,
+        token: Address,
         amount: i128,
     ) {
-        spectator.require_auth();
+        bettor.require_auth();
         let _guard = ReentrancyGuard::new(&env);
-        if amount <= 0 {
-            panic_with_error!(&env, EscrowError::InvalidWager);
-        }
 
         let m = Self::load_match(&env, &game_code);
 
@@ -3261,43 +3405,349 @@ impl ChessterEscrow {
             panic_with_error!(&env, EscrowError::MatchExpired);
         }
 
-        if predicted_winner != m.player1 && Some(predicted_winner.clone()) != m.player2 {
-            panic_with_error!(&env, EscrowError::InvalidWinner);
+        if bettor == m.player1 || Some(bettor.clone()) == m.player2 {
+            panic_with_error!(&env, EscrowError::Unauthorized);
         }
 
-        Self::deposit_wager(&env, &m.token, &spectator, amount);
-
-        let pool_key = (Symbol::new(&env, "side_p"), game_code.clone());
-        let mut pool: SidePool = env
-            .storage()
-            .persistent()
-            .get(&pool_key)
-            .unwrap_or_else(|| SidePool {
-                game_code: game_code.clone(),
-                total_player1_side_staked: 0,
-                total_player2_side_staked: 0,
-                bets: Vec::new(&env),
-            });
-
-        if predicted_winner == m.player1 {
-            pool.total_player1_side_staked =
-                checked_add(&env, pool.total_player1_side_staked, amount);
+        let color = if chosen_player == m.player1 {
+            PlayerColor::White
+        } else if Some(chosen_player) == m.player2 {
+            PlayerColor::Black
         } else {
-            pool.total_player2_side_staked =
-                checked_add(&env, pool.total_player2_side_staked, amount);
+            panic_with_error!(&env, EscrowError::InvalidWinner);
+        };
+
+        if token != m.token {
+            panic_with_error!(&env, EscrowErrorExt::SideBetTokenMismatch);
+        }
+        Self::validate_wager_amount(&env, &token, amount);
+
+        let mut ledger = Self::side_bet_ledger(&env, &game_code)
+            .unwrap_or_else(|| Self::new_side_bet_ledger(&game_code, &token));
+        if ledger.betting_closed {
+            panic_with_error!(&env, EscrowError::SideBetClosed);
         }
 
-        pool.bets.push_back(SideBet {
-            spectator,
-            predicted_winner,
-            amount,
-        });
+        Self::deposit_wager(&env, &token, &bettor, amount);
 
-        env.storage().persistent().set(&pool_key, &pool);
-        Self::bump_entry_ttl(&env, &pool_key);
+        match color {
+            PlayerColor::White => {
+                ledger.total_white_bets = checked_add(&env, ledger.total_white_bets, amount)
+            }
+            PlayerColor::Black => {
+                ledger.total_black_bets = checked_add(&env, ledger.total_black_bets, amount)
+            }
+        }
+        ledger.outstanding = checked_add(&env, ledger.outstanding, amount);
+        Self::store_side_bet_ledger(&env, &ledger);
+
+        let stake_key = DataKey::SideBetStake(game_code.clone(), bettor.clone(), color);
+        let stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&stake_key, &checked_add(&env, stake, amount));
+        Self::bump_entry_ttl(&env, &stake_key);
+
+        env.events().publish(
+            (symbol_short!("side_bet"), game_code.clone()),
+            SideBetPlacedEvent {
+                game_code,
+                bettor,
+                color,
+                amount,
+            },
+        );
     }
 
-    /// Retrieves side bet pool details for a match (Issue #35).
+    /// Stops new side bets on a live match, e.g. once the game reaches move 10 (Coordinator only) (Issue #459).
+    pub fn close_side_betting(env: Env, game_code: String) {
+        let coordinator = Self::get_coordinator(env.clone());
+        coordinator.require_auth();
+
+        let m = Self::load_match(&env, &game_code);
+        if m.status != MatchStatus::Pending && m.status != MatchStatus::Active {
+            panic_with_error!(&env, EscrowError::SideBetClosed);
+        }
+
+        let mut ledger = Self::side_bet_ledger(&env, &game_code)
+            .unwrap_or_else(|| Self::new_side_bet_ledger(&game_code, &m.token));
+        ledger.betting_closed = true;
+        Self::store_side_bet_ledger(&env, &ledger);
+    }
+
+    /// Withdraws everything a spectator is owed from a settled side pool (Issue #459).
+    ///
+    /// Winners receive their stake plus a pro-rata share of the losing pool after the
+    /// protocol fee; on a refund every stake is returned in full. A losing stake pays out
+    /// zero and is cleared. Pull-based, so settlement never loops over bettors.
+    ///
+    /// # Returns
+    /// * `i128` - Amount transferred to `bettor`.
+    pub fn claim_side_bet(env: Env, game_code: String, bettor: Address) -> i128 {
+        bettor.require_auth();
+        let _guard = ReentrancyGuard::new(&env);
+
+        let mut ledger = Self::side_bet_ledger(&env, &game_code)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::SideBetNotFound));
+        if ledger.outcome == SideBetOutcome::Open {
+            panic_with_error!(&env, EscrowErrorExt::SideBetsNotSettled);
+        }
+
+        let white = Self::take_side_bet_stake(&env, &game_code, &bettor, PlayerColor::White);
+        let black = Self::take_side_bet_stake(&env, &game_code, &bettor, PlayerColor::Black);
+        if white == 0 && black == 0 {
+            panic_with_error!(&env, EscrowError::SideBetNotFound);
+        }
+
+        let winning_stake = match ledger.outcome {
+            SideBetOutcome::WhiteWon => white,
+            SideBetOutcome::BlackWon => black,
+            _ => 0,
+        };
+
+        let mut treasury_remainder = 0;
+        let payout = if ledger.outcome == SideBetOutcome::Refund {
+            checked_add(&env, white, black)
+        } else if winning_stake == 0 {
+            0
+        } else {
+            let winning_total = match ledger.outcome {
+                SideBetOutcome::WhiteWon => ledger.total_white_bets,
+                _ => ledger.total_black_bets,
+            };
+            let profit = checked_mul_div(&env, winning_stake, ledger.distributable, winning_total);
+            ledger.unclaimed_winning_stake =
+                checked_sub(&env, ledger.unclaimed_winning_stake, winning_stake);
+            ledger.unclaimed_profit = checked_sub(&env, ledger.unclaimed_profit, profit);
+            if ledger.unclaimed_winning_stake == 0 {
+                treasury_remainder = ledger.unclaimed_profit;
+                ledger.unclaimed_profit = 0;
+            }
+            checked_add(&env, winning_stake, profit)
+        };
+
+        // Effects before interactions: final accounting is stored before any transfer.
+        let released = checked_add(&env, payout, treasury_remainder);
+        ledger.outstanding = checked_sub(&env, ledger.outstanding, released);
+        Self::sub_locked(&env, &ledger.token, released);
+        Self::store_side_bet_ledger(&env, &ledger);
+
+        let token_client = token::Client::new(&env, &ledger.token);
+        if payout > 0 {
+            token_client.transfer(&env.current_contract_address(), &bettor, &payout);
+        }
+        if treasury_remainder > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &Self::side_bet_fee_recipient(&env),
+                &treasury_remainder,
+            );
+        }
+        Self::assert_balance_invariant(&env, &ledger.token);
+
+        env.events().publish(
+            (symbol_short!("side_clm"), game_code.clone()),
+            SideBetClaimedEvent {
+                game_code,
+                bettor,
+                payout,
+                treasury_remainder,
+            },
+        );
+        payout
+    }
+
+    /// Sets the protocol fee taken from losing side pools, at most `MAX_SIDE_BET_FEE_BPS` (Coordinator only) (Issue #459).
+    pub fn set_side_bet_fee_bps(env: Env, fee_bps: u32) {
+        let coordinator = Self::get_coordinator(env.clone());
+        coordinator.require_auth();
+        // Reuses InvalidWager, mirroring the existing set_fee_bps convention.
+        if fee_bps > MAX_SIDE_BET_FEE_BPS {
+            panic_with_error!(&env, EscrowError::InvalidWager);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SideBetFeeBps, &fee_bps);
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Protocol fee (bps) taken from losing side pools; defaults to zero (Issue #459).
+    pub fn get_side_bet_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SideBetFeeBps)
+            .unwrap_or(0)
+    }
+
+    /// Side pool for a match, if any bets were placed or betting was closed (Issue #459).
+    pub fn get_side_bet_ledger(env: Env, game_code: String) -> Option<SideBetLedger> {
+        Self::side_bet_ledger(&env, &game_code)
+    }
+
+    /// Unclaimed stake a bettor holds on one side of a match (Issue #459).
+    pub fn get_side_bet_stake(
+        env: Env,
+        game_code: String,
+        bettor: Address,
+        color: PlayerColor,
+    ) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SideBetStake(game_code, bettor, color))
+            .unwrap_or(0)
+    }
+
+    fn new_side_bet_ledger(game_code: &String, token: &Address) -> SideBetLedger {
+        SideBetLedger {
+            game_code: game_code.clone(),
+            token: token.clone(),
+            total_white_bets: 0,
+            total_black_bets: 0,
+            outcome: SideBetOutcome::Open,
+            betting_closed: false,
+            fee_collected: 0,
+            distributable: 0,
+            unclaimed_winning_stake: 0,
+            unclaimed_profit: 0,
+            outstanding: 0,
+        }
+    }
+
+    fn side_bet_ledger(env: &Env, game_code: &String) -> Option<SideBetLedger> {
+        let key = DataKey::SideBetPool(game_code.clone());
+        let ledger = env.storage().persistent().get(&key);
+        if ledger.is_some() {
+            Self::bump_entry_ttl(env, &key);
+        }
+        ledger
+    }
+
+    fn store_side_bet_ledger(env: &Env, ledger: &SideBetLedger) {
+        let key = DataKey::SideBetPool(ledger.game_code.clone());
+        env.storage().persistent().set(&key, ledger);
+        Self::bump_entry_ttl(env, &key);
+    }
+
+    fn take_side_bet_stake(
+        env: &Env,
+        game_code: &String,
+        bettor: &Address,
+        color: PlayerColor,
+    ) -> i128 {
+        let key = DataKey::SideBetStake(game_code.clone(), bettor.clone(), color);
+        let stake: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if stake > 0 {
+            env.storage().persistent().remove(&key);
+        }
+        stake
+    }
+
+    fn side_bet_fee_recipient(env: &Env) -> Address {
+        Self::get_treasury_vault(env.clone()).unwrap_or_else(|| Self::get_coordinator(env.clone()))
+    }
+
+    /// Settles all spectator bets on a match that just reached a terminal state.
+    /// `winner` is the winning player for a decisive result and `None` for a draw or
+    /// any refund/cancellation path. New-style pools are settled in O(1) and paid out via
+    /// `claim_side_bet`; a legacy `SidePool` is paid out immediately as before.
+    fn settle_side_bets(env: &Env, game_code: &String, m: &Match, winner: Option<&Address>) {
+        Self::settle_legacy_side_pool(env, game_code, m, winner);
+
+        let Some(mut ledger) = Self::side_bet_ledger(env, game_code) else {
+            return;
+        };
+        if ledger.outcome != SideBetOutcome::Open {
+            return;
+        }
+
+        let decisive = winner.map(|w| {
+            if *w == m.player1 {
+                (
+                    SideBetOutcome::WhiteWon,
+                    ledger.total_white_bets,
+                    ledger.total_black_bets,
+                )
+            } else {
+                (
+                    SideBetOutcome::BlackWon,
+                    ledger.total_black_bets,
+                    ledger.total_white_bets,
+                )
+            }
+        });
+
+        match decisive {
+            Some((outcome, winning_total, losing_total)) if winning_total > 0 => {
+                let fee_bps = Self::get_side_bet_fee_bps(env.clone());
+                let fee = checked_mul_div(env, losing_total, fee_bps as i128, BPS_DENOMINATOR);
+                ledger.outcome = outcome;
+                ledger.fee_collected = fee;
+                ledger.distributable = checked_sub(env, losing_total, fee);
+                ledger.unclaimed_winning_stake = winning_total;
+                ledger.unclaimed_profit = ledger.distributable;
+                ledger.outstanding = checked_sub(env, ledger.outstanding, fee);
+                Self::sub_locked(env, &ledger.token, fee);
+                Self::store_side_bet_ledger(env, &ledger);
+                if fee > 0 {
+                    token::Client::new(env, &ledger.token).transfer(
+                        &env.current_contract_address(),
+                        &Self::side_bet_fee_recipient(env),
+                        &fee,
+                    );
+                }
+            }
+            // Draws, refunds and results nobody backed return every stake without a fee.
+            _ => {
+                ledger.outcome = SideBetOutcome::Refund;
+                Self::store_side_bet_ledger(env, &ledger);
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("side_set"), game_code.clone()),
+            SideBetsSettledEvent {
+                game_code: game_code.clone(),
+                outcome: ledger.outcome,
+                fee_collected: ledger.fee_collected,
+            },
+        );
+    }
+
+    /// Pays out a pre-#459 `SidePool` with its original push-based semantics.
+    fn settle_legacy_side_pool(env: &Env, game_code: &String, m: &Match, winner: Option<&Address>) {
+        let pool_key = (Symbol::new(env, "side_p"), game_code.clone());
+        let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) else {
+            return;
+        };
+        let total = checked_add(
+            env,
+            pool.total_player1_side_staked,
+            pool.total_player2_side_staked,
+        );
+        Self::sub_locked(env, &m.token, total);
+
+        let token_client = token::Client::new(env, &m.token);
+        let winning_staked = match winner {
+            Some(w) if *w == m.player1 => pool.total_player1_side_staked,
+            Some(_) => pool.total_player2_side_staked,
+            None => 0,
+        };
+        for bet in pool.bets.iter() {
+            let amount = match winner {
+                Some(w) if winning_staked > 0 => {
+                    if bet.predicted_winner != *w {
+                        continue;
+                    }
+                    checked_mul_div(env, bet.amount, total, winning_staked)
+                }
+                _ => bet.amount,
+            };
+            token_client.transfer(&env.current_contract_address(), &bet.spectator, &amount);
+        }
+        Self::bump_entry_ttl(env, &pool_key);
+    }
+
+    /// Retrieves the legacy (pre-#459) side bet pool for a match (Issue #35).
     ///
     /// # Arguments
     /// * `env` - Environment reference.
@@ -3352,14 +3802,6 @@ impl ChessterEscrow {
         };
 
         if is_canceled {
-            let pool_key = (Symbol::new(&env, "side_p"), game_code.clone());
-            let side_total =
-                if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-                    pool.total_player1_side_staked + pool.total_player2_side_staked
-                } else {
-                    0
-                };
-
             Self::assert_balance_invariant(&env, &m.token);
             let token_client = token::Client::new(&env, &m.token);
             token_client.transfer(&env.current_contract_address(), &m.player1, &m.wager_amount);
@@ -3367,18 +3809,8 @@ impl ChessterEscrow {
                 token_client.transfer(&env.current_contract_address(), &p2, &m.wager_amount);
             }
 
-            if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-                for bet in pool.bets.iter() {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &bet.spectator,
-                        &bet.amount,
-                    );
-                }
-                Self::bump_entry_ttl(&env, &pool_key);
-            }
-
-            Self::sub_locked(&env, &m.token, m.total_staked + side_total);
+            Self::sub_locked(&env, &m.token, m.total_staked);
+            Self::settle_side_bets(&env, &game_code, &m, None);
             Self::assert_balance_invariant(&env, &m.token);
 
             m.status = MatchStatus::Refunded;
@@ -3400,7 +3832,11 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &DataKey::Metrics);
 
             env.events().publish(
-                (Symbol::new(&env, "v1"), symbol_short!("cancelled"), game_code.clone()),
+                (
+                    Symbol::new(&env, "v1"),
+                    symbol_short!("cancelled"),
+                    game_code.clone(),
+                ),
                 MatchCancelledEvent {
                     game_code: game_code.clone(),
                 },
@@ -3433,26 +3869,12 @@ impl ChessterEscrow {
             panic_with_error!(&env, EscrowError::AlreadyJoined);
         }
 
-        let pool_key = (Symbol::new(&env, "side_p"), game_code.clone());
-        let side_total =
-            if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-                pool.total_player1_side_staked + pool.total_player2_side_staked
-            } else {
-                0
-            };
-
         Self::assert_balance_invariant(&env, &m.token);
         let token_client = token::Client::new(&env, &m.token);
         token_client.transfer(&env.current_contract_address(), &m.player1, &m.wager_amount);
 
-        if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-            for bet in pool.bets.iter() {
-                token_client.transfer(&env.current_contract_address(), &bet.spectator, &bet.amount);
-            }
-            Self::bump_entry_ttl(&env, &pool_key);
-        }
-
-        Self::sub_locked(&env, &m.token, m.total_staked + side_total);
+        Self::sub_locked(&env, &m.token, m.total_staked);
+        Self::settle_side_bets(&env, &game_code, &m, None);
         Self::assert_balance_invariant(&env, &m.token);
 
         m.status = MatchStatus::Refunded;
@@ -3514,7 +3936,11 @@ impl ChessterEscrow {
             Self::settle_match(&env, &coordinator, &game_code, &mut m, None);
 
             env.events().publish(
-                (Symbol::new(&env, "v1"), symbol_short!("resolved"), game_code.clone()),
+                (
+                    Symbol::new(&env, "v1"),
+                    symbol_short!("resolved"),
+                    game_code.clone(),
+                ),
                 MatchResolvedEvent {
                     game_code: game_code.clone(),
                     winner: None,
@@ -3687,7 +4113,11 @@ impl ChessterEscrow {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("timeout"), game_code.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("timeout"),
+                game_code.clone(),
+            ),
             MatchTimeoutClaimedEvent {
                 game_code,
                 claimant,
@@ -3724,7 +4154,11 @@ impl ChessterEscrow {
         Self::settle_match(&env, &coordinator, &game_code, &mut m, Some(winner.clone()));
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("forfeited"), game_code.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("forfeited"),
+                game_code.clone(),
+            ),
             MatchForfeitedEvent {
                 game_code,
                 forfeiting_player,
@@ -3764,7 +4198,11 @@ impl ChessterEscrow {
         Self::execute_emergency_refund(&env, &game_code, &mut m);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("emer_ref"), game_code.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("emer_ref"),
+                game_code.clone(),
+            ),
             MatchEmergencyRefundedEvent { game_code, caller },
         );
     }
@@ -3777,18 +4215,6 @@ impl ChessterEscrow {
         winner: Option<Address>,
     ) -> i128 {
         let token_client = token::Client::new(env, &m.token);
-
-        let pool_key = (Symbol::new(env, "side_p"), game_code.clone());
-        let pool = env.storage().persistent().get::<_, SidePool>(&pool_key);
-        let side_total = if let Some(ref p) = pool {
-            checked_add(
-                env,
-                p.total_player1_side_staked,
-                p.total_player2_side_staked,
-            )
-        } else {
-            0
-        };
 
         Self::assert_balance_invariant(env, &m.token);
 
@@ -3815,7 +4241,7 @@ impl ChessterEscrow {
         env.storage().persistent().set(game_code, m);
         Self::bump_entry_ttl(env, game_code);
 
-        Self::sub_locked(env, &m.token, checked_add(env, m.total_staked, side_total));
+        Self::sub_locked(env, &m.token, m.total_staked);
         Self::remove_from_active_lists(env, game_code, m);
 
         // --- INTERACTIONS: external token transfers only after state is final. ---
@@ -3827,8 +4253,14 @@ impl ChessterEscrow {
             if admin_fee > 0 {
                 token_client.transfer(&env.current_contract_address(), &fee_recipient, &admin_fee);
                 let fee_key = DataKey::TotalFeesCollected(m.token.clone());
-                let total = env.storage().persistent().get::<_, i128>(&fee_key).unwrap_or(0);
-                env.storage().persistent().set(&fee_key, &checked_add(env, total, admin_fee));
+                let total = env
+                    .storage()
+                    .persistent()
+                    .get::<_, i128>(&fee_key)
+                    .unwrap_or(0);
+                env.storage()
+                    .persistent()
+                    .set(&fee_key, &checked_add(env, total, admin_fee));
                 Self::bump_entry_ttl(env, &fee_key);
             }
         } else {
@@ -3838,51 +4270,7 @@ impl ChessterEscrow {
             }
         }
 
-        if let Some(pool) = pool {
-            if let Some(w) = winner.clone() {
-                let winning_staked = if w == m.player1 {
-                    pool.total_player1_side_staked
-                } else {
-                    pool.total_player2_side_staked
-                };
-                let total_side_staked = checked_add(
-                    env,
-                    pool.total_player1_side_staked,
-                    pool.total_player2_side_staked,
-                );
-
-                if winning_staked > 0 {
-                    for bet in pool.bets.iter() {
-                        if bet.predicted_winner == w {
-                            let payout =
-                                checked_mul_div(env, bet.amount, total_side_staked, winning_staked);
-                            token_client.transfer(
-                                &env.current_contract_address(),
-                                &bet.spectator,
-                                &payout,
-                            );
-                        }
-                    }
-                } else {
-                    for bet in pool.bets.iter() {
-                        token_client.transfer(
-                            &env.current_contract_address(),
-                            &bet.spectator,
-                            &bet.amount,
-                        );
-                    }
-                }
-            } else {
-                for bet in pool.bets.iter() {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &bet.spectator,
-                        &bet.amount,
-                    );
-                }
-            }
-            Self::bump_entry_ttl(env, &pool_key);
-        }
+        Self::settle_side_bets(env, game_code, m, winner.as_ref());
 
         Self::assert_balance_invariant(env, &m.token);
 
@@ -3941,7 +4329,11 @@ impl ChessterEscrow {
 
     fn emit_milestone_event(env: &Env, player: Address, streak_count: u32, milestone_type: Symbol) {
         env.events().publish(
-            (Symbol::new(env, "v1"), symbol_short!("milestone"), player.clone()),
+            (
+                Symbol::new(env, "v1"),
+                symbol_short!("milestone"),
+                player.clone(),
+            ),
             (streak_count, milestone_type),
         );
     }
@@ -4166,7 +4558,7 @@ impl ChessterEscrow {
 
         let count = game_codes.len();
         env.events().publish(
-            (Symbol::new(&env, "v1"), Symbol::new(&env, "batch_refunded"),),
+            (Symbol::new(&env, "v1"), Symbol::new(&env, "batch_refunded")),
             BatchRefundedEvent { count, game_codes },
         );
         count
@@ -4237,7 +4629,11 @@ impl ChessterEscrow {
         Self::execute_refund(&env, &game_code, &mut m);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("autoref"), game_code.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("autoref"),
+                game_code.clone(),
+            ),
             MatchAutoRefunded {
                 game_code,
                 player1,
@@ -4364,7 +4760,11 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &sp_key);
 
             env.events().publish(
-                (Symbol::new(&env, "v1"), symbol_short!("funded"), game_code.clone()),
+                (
+                    Symbol::new(&env, "v1"),
+                    symbol_short!("funded"),
+                    game_code.clone(),
+                ),
                 MatchFundedEvent {
                     game_code: game_code.clone(),
                     player2: player.clone(),
@@ -4373,7 +4773,11 @@ impl ChessterEscrow {
             );
 
             env.events().publish(
-                (Symbol::new(&env, "v1"), symbol_short!("spons"), game_code.clone()),
+                (
+                    Symbol::new(&env, "v1"),
+                    symbol_short!("spons"),
+                    game_code.clone(),
+                ),
                 SponsoredDepositEvent {
                     game_code,
                     player,
@@ -4470,7 +4874,11 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &sp_key);
 
             env.events().publish(
-                (Symbol::new(&env, "v1"), symbol_short!("created"), game_code.clone()),
+                (
+                    Symbol::new(&env, "v1"),
+                    symbol_short!("created"),
+                    game_code.clone(),
+                ),
                 MatchCreatedEvent {
                     game_code: game_code.clone(),
                     player1: player.clone(),
@@ -4480,7 +4888,11 @@ impl ChessterEscrow {
             );
 
             env.events().publish(
-                (Symbol::new(&env, "v1"), symbol_short!("spons"), game_code.clone()),
+                (
+                    Symbol::new(&env, "v1"),
+                    symbol_short!("spons"),
+                    game_code.clone(),
+                ),
                 SponsoredDepositEvent {
                     game_code,
                     player,
@@ -4549,7 +4961,7 @@ impl ChessterEscrow {
         if env.ledger().timestamp()
             > m.cancellation_proposed_at.unwrap_or(0) + CANCELLATION_PROPOSAL_TIMEOUT_SECS
         {
-            panic_with_error!(&env, EscrowError::ProposalExpired);
+            panic_with_error!(&env, EscrowErrorExt::ProposalExpired);
         }
 
         if proposer == opponent {
@@ -4568,7 +4980,11 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &game_code);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("mut_canc"), game_code.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("mut_canc"),
+                game_code.clone(),
+            ),
             MatchMutualCancelled {
                 game_code,
                 proposed_by: proposer,
@@ -4607,14 +5023,6 @@ impl ChessterEscrow {
     fn execute_refund(env: &Env, game_code: &String, m: &mut Match) {
         let token_client = token::Client::new(env, &m.token);
 
-        let pool_key = (Symbol::new(env, "side_p"), game_code.clone());
-        let side_total =
-            if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-                pool.total_player1_side_staked + pool.total_player2_side_staked
-            } else {
-                0
-            };
-
         Self::assert_balance_invariant(env, &m.token);
 
         token_client.transfer(&env.current_contract_address(), &m.player1, &m.wager_amount);
@@ -4622,14 +5030,8 @@ impl ChessterEscrow {
             token_client.transfer(&env.current_contract_address(), &p2, &m.wager_amount);
         }
 
-        if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-            for bet in pool.bets.iter() {
-                token_client.transfer(&env.current_contract_address(), &bet.spectator, &bet.amount);
-            }
-            Self::bump_entry_ttl(env, &pool_key);
-        }
-
-        Self::sub_locked(env, &m.token, m.total_staked + side_total);
+        Self::sub_locked(env, &m.token, m.total_staked);
+        Self::settle_side_bets(env, game_code, m, None);
         Self::assert_balance_invariant(env, &m.token);
 
         m.status = MatchStatus::Refunded;
@@ -4660,13 +5062,21 @@ impl ChessterEscrow {
             (None::<Address>, m.total_staked, 0_i128).into_val(env),
         );
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("refunded"), game_code.clone()),
+            (
+                Symbol::new(env, "v1"),
+                symbol_short!("refunded"),
+                game_code.clone(),
+            ),
             MatchRefundedEvent {
                 game_code: game_code.clone(),
             },
         );
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("expired"), game_code.clone()),
+            (
+                Symbol::new(env, "v1"),
+                symbol_short!("expired"),
+                game_code.clone(),
+            ),
             MatchExpiredEvent {
                 game_code: game_code.clone(),
             },
@@ -4677,14 +5087,6 @@ impl ChessterEscrow {
     /// the match `EmergencyRefunded`, bypassing the coordinator-settlement path entirely (Issue #433).
     fn execute_emergency_refund(env: &Env, game_code: &String, m: &mut Match) {
         let token_client = token::Client::new(env, &m.token);
-
-        let pool_key = (Symbol::new(env, "side_p"), game_code.clone());
-        let side_total =
-            if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-                pool.total_player1_side_staked + pool.total_player2_side_staked
-            } else {
-                0
-            };
 
         Self::assert_balance_invariant(env, &m.token);
 
@@ -4698,14 +5100,8 @@ impl ChessterEscrow {
         token_client.transfer(&env.current_contract_address(), &m.player1, &half_wager);
         token_client.transfer(&env.current_contract_address(), &p2, &remaining_half);
 
-        if let Some(pool) = env.storage().persistent().get::<_, SidePool>(&pool_key) {
-            for bet in pool.bets.iter() {
-                token_client.transfer(&env.current_contract_address(), &bet.spectator, &bet.amount);
-            }
-            Self::bump_entry_ttl(env, &pool_key);
-        }
-
-        Self::sub_locked(env, &m.token, m.total_staked + side_total);
+        Self::sub_locked(env, &m.token, m.total_staked);
+        Self::settle_side_bets(env, game_code, m, None);
         Self::assert_balance_invariant(env, &m.token);
 
         m.status = MatchStatus::EmergencyRefunded;
@@ -4971,6 +5367,17 @@ impl ChessterEscrow {
                 if env.storage().persistent().has(&pool_key) {
                     env.storage().persistent().remove(&pool_key);
                 }
+                // A side pool with unclaimed funds outlives its match so bettors can still claim.
+                let ledger_key = DataKey::SideBetPool(game_code.clone());
+                if let Some(ledger) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, SideBetLedger>(&ledger_key)
+                {
+                    if ledger.outstanding == 0 {
+                        env.storage().persistent().remove(&ledger_key);
+                    }
+                }
                 return true;
             }
         }
@@ -5048,7 +5455,11 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &tournament_id);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("tourn_crt"), tournament_id),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("tourn_crt"),
+                tournament_id,
+            ),
             (buy_in_amount, effective_max, effective_min),
         );
     }
@@ -5121,7 +5532,12 @@ impl ChessterEscrow {
         Self::assert_balance_invariant(&env, &tournament.token);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("tourn_jn"), tournament_id, player),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("tourn_jn"),
+                tournament_id,
+                player,
+            ),
             tournament.total_pool,
         );
     }
@@ -5202,7 +5618,8 @@ impl ChessterEscrow {
                 }
             }
         }
-        let (net_pool, rake) = Self::calculate_tournament_rake(&env, tournament.total_pool, fee_bps);
+        let (net_pool, rake) =
+            Self::calculate_tournament_rake(&env, tournament.total_pool, fee_bps);
 
         tournament.status = TournamentStatus::Completed;
         tournament.final_rankings = winners.clone();
@@ -5217,7 +5634,7 @@ impl ChessterEscrow {
         let mut total_distributed: i128 = 0;
         let num_winners = winners.len();
         let mut accumulated_residuals: i128 = 0;
-        
+
         for i in 0..num_winners {
             let winner = winners.get(i).unwrap();
             let bps = payout_bps.get(i).unwrap();
@@ -5225,28 +5642,29 @@ impl ChessterEscrow {
                 // Last winner gets the remainder to ensure total payout equals net_pool exactly
                 let final_payout = net_pool
                     .checked_sub(total_distributed)
-                    .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
+                    .unwrap_or_else(|| panic_with_error!(&env, EscrowErrorExt::ArithmeticOverflow));
                 (final_payout, 0)
             } else {
                 mul_div_bps(&env, net_pool, bps)
             };
-            
+
             // Apply accumulated residuals to first place winner (Issue #484)
             let payout = if i == 0 {
-                payout_base.checked_add(accumulated_residuals)
-                    .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow))
+                payout_base
+                    .checked_add(accumulated_residuals)
+                    .unwrap_or_else(|| panic_with_error!(&env, EscrowErrorExt::ArithmeticOverflow))
             } else {
                 payout_base
             };
-            
+
             total_distributed = total_distributed
                 .checked_add(payout)
-                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
-            
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowErrorExt::ArithmeticOverflow));
+
             // Accumulate residuals from this prize tier
             accumulated_residuals = accumulated_residuals
                 .checked_add(residual)
-                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowErrorExt::ArithmeticOverflow));
 
             if payout > 0 {
                 let is_disqualified = tournament.disqualified.get(winner.clone()).unwrap_or(false);
@@ -5262,7 +5680,7 @@ impl ChessterEscrow {
 
         let total_out = total_distributed
             .checked_add(rake)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowErrorExt::ArithmeticOverflow));
         if total_out != tournament.total_pool {
             panic_with_error!(&env, EscrowError::InvariantViolated);
         }
@@ -5271,7 +5689,11 @@ impl ChessterEscrow {
         Self::assert_balance_invariant(&env, &tournament.token);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("tourn_cmp"), tournament_id),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("tourn_cmp"),
+                tournament_id,
+            ),
             (winners, tournament.total_pool, rake),
         );
     }
@@ -5309,7 +5731,11 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &tournament_id);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("tourn_can"), tournament_id),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("tourn_can"),
+                tournament_id,
+            ),
             tournament.players.len(),
         );
     }
@@ -5367,7 +5793,12 @@ impl ChessterEscrow {
         Self::assert_balance_invariant(&env, &tournament.token);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("tourn_ref"), tournament_id, player),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("tourn_ref"),
+                tournament_id,
+                player,
+            ),
             tournament.buy_in_amount,
         );
     }
@@ -5405,7 +5836,11 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &tournament_id);
 
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("tourn_dq"), tournament_id),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("tourn_dq"),
+                tournament_id,
+            ),
             (player, reason_code),
         );
     }
@@ -5469,7 +5904,11 @@ impl ChessterEscrow {
             STORAGE_TTL_EXTENDED,
         );
         env.events().publish(
-            (Symbol::new(&env, "v1"), symbol_short!("elo_r"), player.clone()),
+            (
+                Symbol::new(&env, "v1"),
+                symbol_short!("elo_r"),
+                player.clone(),
+            ),
             PlayerEloUpdatedEvent { player, new_elo },
         );
     }
@@ -5564,6 +6003,6 @@ impl ChessterEscrow {
     }
 }
 
-mod test;
 #[cfg(test)]
 mod error_tests;
+mod test;
