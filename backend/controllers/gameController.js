@@ -667,6 +667,7 @@ class GameController {
 			});
 			const cacheStatus = leaderboard && leaderboard._cacheHit ? "HIT" : "MISS";
 			res.setHeader("X-Cache", cacheStatus);
+			res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
 			res.json({ success: true, data: leaderboard });
 		} catch (error) {
 			res.status(500).json({ success: false, error: error.message });
