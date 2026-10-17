@@ -150,6 +150,8 @@ pub enum EscrowError {
     UnauthorizedPlayer = 49,
     /// Mutual cancellation proposal is older than the confirmation window.
     ProposalExpired = 50,
+    /// Arithmetic overflow occurred during tournament prize calculation (Issue #484).
+    ArithmeticOverflow = 51,
 }
 
 /// Payload for player deposit authorization with nonce-based replay protection (Issue #284).
@@ -595,6 +597,35 @@ pub struct AdminActionProposal {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigAdmins {
+    /// Three distinct admin addresses required for 2-of-3 multisig pause/unpause.
+    pub admins: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseProposal {
+    /// Admin who proposed the pause.
+    pub proposer: Address,
+    /// Timestamp when proposal was created.
+    pub proposed_at: u64,
+    /// Whether the proposal has been executed.
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpauseProposal {
+    /// Admin who proposed the unpause.
+    pub proposer: Address,
+    /// Timestamp when proposal was created.
+    pub proposed_at: u64,
+    /// Whether the proposal has been executed.
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoordinatorRotationProposedEvent {
     pub proposed_coordinator: Address,
 }
@@ -619,6 +650,66 @@ pub struct ContractPausedEvent {
 pub struct ContractUnpausedEvent {
     /// Coordinator address that lifted the pause.
     pub coordinator: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published when an admin proposes a multisig pause.
+pub struct PauseProposaledEvent {
+    /// Admin who proposed the pause.
+    pub proposer: Address,
+    /// Timestamp when proposal was created.
+    pub proposed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published when an admin confirms a multisig pause proposal.
+pub struct PauseConfirmedEvent {
+    /// Admin who confirmed the pause.
+    pub confirmer: Address,
+    /// Count of total confirmations for this proposal.
+    pub confirmation_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published when a multisig pause is executed.
+pub struct MultisigPauseExecutedEvent {
+    /// First confirming admin.
+    pub admin1: Address,
+    /// Second confirming admin.
+    pub admin2: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published when an admin proposes a multisig unpause.
+pub struct UnpauseProposaledEvent {
+    /// Admin who proposed the unpause.
+    pub proposer: Address,
+    /// Timestamp when proposal was created.
+    pub proposed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published when an admin confirms a multisig unpause proposal.
+pub struct UnpauseConfirmedEvent {
+    /// Admin who confirmed the unpause.
+    pub confirmer: Address,
+    /// Count of total confirmations for this proposal.
+    pub confirmation_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Published when a multisig unpause is executed.
+pub struct MultisigUnpauseExecutedEvent {
+    /// First confirming admin.
+    pub admin1: Address,
+    /// Second confirming admin.
+    pub admin2: Address,
 }
 
 #[contracttype]
@@ -667,13 +758,13 @@ pub const TOPIC_REFUNDED: Symbol = symbol_short!("refunded");
 
 /// Centralized event publishing helper to guarantee uniform indexing format across all match lifecycle transitions.
 pub fn emit_match_event(env: &Env, topic: Symbol, match_id: u64, data: Val) {
-    let topics = (symbol_short!("escrow"), topic, match_id);
+    let topics = (Symbol::new(env, "v1"), symbol_short!("escrow"), topic, match_id);
     env.events().publish(topics, data);
 }
 
 /// Centralized event publishing helper for match settlements.
 pub fn emit_match_settled(env: &Env, match_id: u64, winner: &Address, payout: i128, fee: i128) {
-    let topics = (symbol_short!("escrow"), symbol_short!("settled"), match_id);
+    let topics = (Symbol::new(env, "v1"), symbol_short!("escrow"), symbol_short!("settled"), match_id);
     let data = (winner.clone(), payout, fee);
     env.events().publish(topics, data);
 }
@@ -757,11 +848,29 @@ fn checked_mul_div(env: &Env, a: i128, b: i128, denom: i128) -> i128 {
         .unwrap_or_else(|| panic_with_error!(env, EscrowError::InvariantViolated))
 }
 
-fn mul_div_bps(amount: i128, bps: u32) -> i128 {
-    let bps = i128::from(bps);
-    let whole = (amount / BPS_DENOMINATOR).checked_mul(bps).unwrap();
-    let fraction = (amount % BPS_DENOMINATOR).checked_mul(bps).unwrap() / BPS_DENOMINATOR;
-    whole.checked_add(fraction).unwrap()
+/// Calculate (amount * bps) / 10_000 with safe arithmetic.
+/// Returns (quotient, remainder) where remainder is the residual that should be
+/// credited to ensure exact total payout (Issue #484).
+fn mul_div_bps(env: &Env, amount: i128, bps: u32) -> (i128, i128) {
+    let bps_i128 = i128::from(bps);
+    
+    // Decompose to avoid overflow: (a/b)*c + (a%b)*c/b
+    let whole = (amount / BPS_DENOMINATOR)
+        .checked_mul(bps_i128)
+        .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
+    
+    let remainder_part = (amount % BPS_DENOMINATOR)
+        .checked_mul(bps_i128)
+        .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
+    
+    let fraction = remainder_part / BPS_DENOMINATOR;
+    let residual = remainder_part % BPS_DENOMINATOR;
+    
+    let quotient = whole
+        .checked_add(fraction)
+        .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
+    
+    (quotient, residual)
 }
 
 /// Payload for resolving a match via Ed25519 signature.
@@ -896,7 +1005,7 @@ impl ChessterEscrow {
             .set(&Symbol::new(&env, "paused"), &true);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (symbol_short!("paused"),),
+            (Symbol::new(&env, "v1"), symbol_short!("paused"),),
             ContractPausedEvent { coordinator },
         );
     }
@@ -913,7 +1022,7 @@ impl ChessterEscrow {
             .set(&Symbol::new(&env, "paused"), &false);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (symbol_short!("unpause"),),
+            (Symbol::new(&env, "v1"), symbol_short!("unpause"),),
             ContractUnpausedEvent { coordinator },
         );
     }
@@ -966,7 +1075,7 @@ impl ChessterEscrow {
             .set(&Self::migration_key(&env), &true);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (symbol_short!("mig_auth"),),
+            (Symbol::new(&env, "v1"), symbol_short!("mig_auth"),),
             MigrationAuthorizedEvent { coordinator },
         );
     }
@@ -984,7 +1093,7 @@ impl ChessterEscrow {
             .set(&Self::migration_key(&env), &false);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (symbol_short!("mig_revk"),),
+            (Symbol::new(&env, "v1"), symbol_short!("mig_revk"),),
             MigrationRevokedEvent { coordinator },
         );
     }
@@ -1064,7 +1173,7 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
-            (symbol_short!("emrg_drn"), token.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("emrg_drn"), token.clone()),
             EmergencyDrainEvent {
                 coordinator,
                 token,
@@ -1295,7 +1404,7 @@ impl ChessterEscrow {
         coordinator.require_auth();
 
         env.storage().persistent().remove(&DataKey::DrainSchedule);
-        env.events().publish((symbol_short!("drain_can"),), ());
+        env.events().publish((Symbol::new(&env, "v1"), symbol_short!("drain_can"),), ());
     }
 
     /// Executes a scheduled emergency drain after the 7-day timelock has expired (Issue #285).
@@ -1471,9 +1580,11 @@ impl ChessterEscrow {
     ///
     /// # Returns
     /// * `(i128, i128)` - (net_prize, rake).
-    pub fn calculate_tournament_rake(total_pool: i128, fee_bps: u32) -> (i128, i128) {
-        let rake = mul_div_bps(total_pool, fee_bps);
-        let net_prize = total_pool - rake;
+    pub fn calculate_tournament_rake(env: &Env, total_pool: i128, fee_bps: u32) -> (i128, i128) {
+        let (rake, _) = mul_div_bps(env, total_pool, fee_bps);
+        let net_prize = total_pool
+            .checked_sub(rake)
+            .unwrap_or_else(|| panic_with_error!(env, EscrowError::ArithmeticOverflow));
         (net_prize, rake)
     }
 
@@ -1598,6 +1709,351 @@ impl ChessterEscrow {
     /// * `Vec<Address>` - Authorized signer addresses.
     pub fn get_admin_signers(env: Env) -> Vec<Address> {
         Self::get_signers(&env)
+    }
+
+    // -----------------------------------------------------------------------
+    // Multisig Emergency Pause Mechanism (Issue #486)
+    // -----------------------------------------------------------------------
+
+    fn multisig_admins_key(env: &Env) -> Symbol {
+        Symbol::new(env, "ms_admins")
+    }
+
+    fn pause_proposal_key(env: &Env) -> Symbol {
+        Symbol::new(env, "pause_prop")
+    }
+
+    fn unpause_proposal_key(env: &Env) -> Symbol {
+        Symbol::new(env, "unpause_prop")
+    }
+
+    fn pause_confirmations_key(env: &Env) -> Symbol {
+        Symbol::new(env, "pause_conf")
+    }
+
+    fn unpause_confirmations_key(env: &Env) -> Symbol {
+        Symbol::new(env, "unpause_conf")
+    }
+
+    /// Sets the three distinct admin addresses for 2-of-3 multisig pause/unpause (Coordinator only).
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `admin1` - First admin address.
+    /// * `admin2` - Second admin address.
+    /// * `admin3` - Third admin address.
+    pub fn set_multisig_admins(env: Env, admin1: Address, admin2: Address, admin3: Address) {
+        let coordinator = Self::get_coordinator(env.clone());
+        coordinator.require_auth();
+
+        // Ensure all three addresses are distinct
+        if admin1 == admin2 || admin2 == admin3 || admin1 == admin3 {
+            panic_with_error!(&env, EscrowError::UnauthorizedSigner);
+        }
+
+        let mut admins = Vec::new(&env);
+        admins.push_back(admin1);
+        admins.push_back(admin2);
+        admins.push_back(admin3);
+
+        env.storage()
+            .instance()
+            .set(&Self::multisig_admins_key(&env), &admins);
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Retrieves the three multisig admin addresses.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    ///
+    /// # Returns
+    /// * `Vec<Address>` - Vector containing exactly 3 admin addresses.
+    pub fn get_multisig_admins(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&Self::multisig_admins_key(&env))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn is_multisig_admin(env: &Env, addr: &Address) -> bool {
+        Self::get_multisig_admins(env.clone()).contains(addr)
+    }
+
+    /// Proposes a multisig pause by any registered admin.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `admin` - Proposing admin address.
+    pub fn propose_pause(env: Env, admin: Address) {
+        admin.require_auth();
+
+        // Verify admin is registered
+        if !Self::is_multisig_admin(&env, &admin) {
+            panic_with_error!(&env, EscrowError::UnauthorizedSigner);
+        }
+
+        // Check if proposal already exists
+        let pause_key = Self::pause_proposal_key(&env);
+        if env.storage().persistent().has(&pause_key) {
+            panic_with_error!(&env, EscrowError::RotationAlreadyProposed);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut confirmations = Vec::new(&env);
+        confirmations.push_back(admin.clone());
+
+        let proposal = PauseProposal {
+            proposer: admin.clone(),
+            proposed_at: now,
+            executed: false,
+        };
+
+        env.storage().persistent().set(&pause_key, &proposal);
+        Self::bump_entry_ttl(&env, &pause_key);
+
+        // Store initial confirmations
+        env.storage()
+            .persistent()
+            .set(&Self::pause_confirmations_key(&env), &confirmations);
+        Self::bump_entry_ttl(&env, &Self::pause_confirmations_key(&env));
+
+        env.events().publish(
+            (symbol_short!("pause_prop"),),
+            PauseProposaledEvent {
+                proposer: admin,
+                proposed_at: now,
+            },
+        );
+    }
+
+    /// Confirms a pending multisig pause by a second distinct admin.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `admin` - Confirming admin address.
+    pub fn confirm_pause(env: Env, admin: Address) {
+        admin.require_auth();
+
+        // Verify admin is registered
+        if !Self::is_multisig_admin(&env, &admin) {
+            panic_with_error!(&env, EscrowError::UnauthorizedSigner);
+        }
+
+        let pause_key = Self::pause_proposal_key(&env);
+        let mut proposal = env
+            .storage()
+            .persistent()
+            .get(&pause_key)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::RotationNotProposed));
+
+        // Check if already executed
+        if proposal.executed {
+            panic_with_error!(&env, EscrowError::AlreadyApproved);
+        }
+
+        // Get current confirmations
+        let mut confirmations = env
+            .storage()
+            .persistent()
+            .get(&Self::pause_confirmations_key(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if already confirmed by this admin
+        if confirmations.contains(&admin) {
+            panic_with_error!(&env, EscrowError::AlreadyApproved);
+        }
+
+        // Add confirmation
+        confirmations.push_back(admin.clone());
+
+        // Check if threshold is met (2 of 3)
+        if confirmations.len() >= 2 {
+            // Execute pause
+            proposal.executed = true;
+            env.storage().persistent().set(&pause_key, &proposal);
+            Self::bump_entry_ttl(&env, &pause_key);
+
+            // Set paused flag
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "paused"), &true);
+            Self::bump_instance_ttl(&env);
+
+            // Get the two confirming admins for event
+            let admin1 = confirmations.get(0).unwrap();
+            let admin2 = confirmations.get(1).unwrap();
+
+            env.events().publish(
+                (symbol_short!("pause_exe"),),
+                MultisigPauseExecutedEvent { admin1, admin2 },
+            );
+        } else {
+            // Update confirmations count
+            env.storage()
+                .persistent()
+                .set(&Self::pause_confirmations_key(&env), &confirmations);
+            Self::bump_entry_ttl(&env, &Self::pause_confirmations_key(&env));
+
+            env.events().publish(
+                (symbol_short!("pause_conf"),),
+                PauseConfirmedEvent {
+                    confirmer: admin,
+                    confirmation_count: confirmations.len() as u32,
+                },
+            );
+        }
+    }
+
+    /// Proposes a multisig unpause by any registered admin.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `admin` - Proposing admin address.
+    pub fn propose_unpause(env: Env, admin: Address) {
+        admin.require_auth();
+
+        // Verify admin is registered
+        if !Self::is_multisig_admin(&env, &admin) {
+            panic_with_error!(&env, EscrowError::UnauthorizedSigner);
+        }
+
+        // Check if proposal already exists
+        let unpause_key = Self::unpause_proposal_key(&env);
+        if env.storage().persistent().has(&unpause_key) {
+            panic_with_error!(&env, EscrowError::RotationAlreadyProposed);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut confirmations = Vec::new(&env);
+        confirmations.push_back(admin.clone());
+
+        let proposal = UnpauseProposal {
+            proposer: admin.clone(),
+            proposed_at: now,
+            executed: false,
+        };
+
+        env.storage().persistent().set(&unpause_key, &proposal);
+        Self::bump_entry_ttl(&env, &unpause_key);
+
+        // Store initial confirmations
+        env.storage()
+            .persistent()
+            .set(&Self::unpause_confirmations_key(&env), &confirmations);
+        Self::bump_entry_ttl(&env, &Self::unpause_confirmations_key(&env));
+
+        env.events().publish(
+            (symbol_short!("unpause_prop"),),
+            UnpauseProposaledEvent {
+                proposer: admin,
+                proposed_at: now,
+            },
+        );
+    }
+
+    /// Confirms a pending multisig unpause by a second distinct admin.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `admin` - Confirming admin address.
+    pub fn confirm_unpause(env: Env, admin: Address) {
+        admin.require_auth();
+
+        // Verify admin is registered
+        if !Self::is_multisig_admin(&env, &admin) {
+            panic_with_error!(&env, EscrowError::UnauthorizedSigner);
+        }
+
+        let unpause_key = Self::unpause_proposal_key(&env);
+        let mut proposal = env
+            .storage()
+            .persistent()
+            .get(&unpause_key)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::RotationNotProposed));
+
+        // Check if already executed
+        if proposal.executed {
+            panic_with_error!(&env, EscrowError::AlreadyApproved);
+        }
+
+        // Get current confirmations
+        let mut confirmations = env
+            .storage()
+            .persistent()
+            .get(&Self::unpause_confirmations_key(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if already confirmed by this admin
+        if confirmations.contains(&admin) {
+            panic_with_error!(&env, EscrowError::AlreadyApproved);
+        }
+
+        // Add confirmation
+        confirmations.push_back(admin.clone());
+
+        // Check if threshold is met (2 of 3)
+        if confirmations.len() >= 2 {
+            // Execute unpause
+            proposal.executed = true;
+            env.storage().persistent().set(&unpause_key, &proposal);
+            Self::bump_entry_ttl(&env, &unpause_key);
+
+            // Clear paused flag
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, "paused"), &false);
+            Self::bump_instance_ttl(&env);
+
+            // Get the two confirming admins for event
+            let admin1 = confirmations.get(0).unwrap();
+            let admin2 = confirmations.get(1).unwrap();
+
+            env.events().publish(
+                (symbol_short!("unpause_exe"),),
+                MultisigUnpauseExecutedEvent { admin1, admin2 },
+            );
+        } else {
+            // Update confirmations count
+            env.storage()
+                .persistent()
+                .set(&Self::unpause_confirmations_key(&env), &confirmations);
+            Self::bump_entry_ttl(&env, &Self::unpause_confirmations_key(&env));
+
+            env.events().publish(
+                (symbol_short!("unpause_conf"),),
+                UnpauseConfirmedEvent {
+                    confirmer: admin,
+                    confirmation_count: confirmations.len() as u32,
+                },
+            );
+        }
+    }
+
+    /// Retrieves the pending pause proposal if one exists.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    ///
+    /// # Returns
+    /// * `Option<PauseProposal>` - Pending pause proposal or None.
+    pub fn get_pause_proposal(env: Env) -> Option<PauseProposal> {
+        env.storage()
+            .persistent()
+            .get(&Self::pause_proposal_key(&env))
+    }
+
+    /// Retrieves the pending unpause proposal if one exists.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    ///
+    /// # Returns
+    /// * `Option<UnpauseProposal>` - Pending unpause proposal or None.
+    pub fn get_unpause_proposal(env: Env) -> Option<UnpauseProposal> {
+        env.storage()
+            .persistent()
+            .get(&Self::unpause_proposal_key(&env))
     }
 
     fn guardians_key(env: &Env) -> Symbol {
@@ -1774,7 +2230,7 @@ impl ChessterEscrow {
         }
         Self::record_rotation_approval(&env, &signer, &new_coordinator);
         env.events().publish(
-            (symbol_short!("rot_prop"),),
+            (Symbol::new(&env, "v1"), symbol_short!("rot_prop"),),
             CoordinatorRotationProposedEvent {
                 proposed_coordinator: new_coordinator,
             },
@@ -1833,7 +2289,7 @@ impl ChessterEscrow {
             env.storage().instance().remove(&key);
             Self::bump_instance_ttl(env);
             env.events().publish(
-                (symbol_short!("rot_exec"),),
+                (Symbol::new(&env, "v1"), symbol_short!("rot_exec"),),
                 CoordinatorRotationExecutedEvent {
                     new_coordinator: new_coordinator.clone(),
                 },
@@ -1950,7 +2406,7 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(env);
 
         env.events().publish(
-            (symbol_short!("w_limits"),),
+            (Symbol::new(&env, "v1"), symbol_short!("w_limits"),),
             WagerLimitsUpdatedEvent {
                 min_wager,
                 max_wager,
@@ -2028,7 +2484,7 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(env);
 
         env.events().publish(
-            (symbol_short!("tok_wlim"), token.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("tok_wlim"), token.clone()),
             TokenWagerLimitsUpdatedEvent {
                 token: token.clone(),
                 min_wager,
@@ -2478,7 +2934,7 @@ impl ChessterEscrow {
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
-            (Symbol::new(&env, "asset_config_updated"), token.clone()),
+            (Symbol::new(&env, "v1"), Symbol::new(&env, "asset_config_updated"), token.clone()),
             AssetConfigUpdatedEvent {
                 token,
                 min_wager: config.min_wager,
@@ -2662,7 +3118,7 @@ impl ChessterEscrow {
             (player1.clone(), token.clone(), amount).into_val(&env),
         );
         env.events().publish(
-            (symbol_short!("created"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("created"), game_code.clone()),
             MatchCreatedEvent {
                 game_code,
                 player1,
@@ -2763,7 +3219,7 @@ impl ChessterEscrow {
             (player2.clone(), m.total_staked).into_val(&env),
         );
         env.events().publish(
-            (symbol_short!("funded"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("funded"), game_code.clone()),
             MatchFundedEvent {
                 game_code,
                 player2,
@@ -2944,7 +3400,7 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &DataKey::Metrics);
 
             env.events().publish(
-                (symbol_short!("cancelled"), game_code.clone()),
+                (Symbol::new(&env, "v1"), symbol_short!("cancelled"), game_code.clone()),
                 MatchCancelledEvent {
                     game_code: game_code.clone(),
                 },
@@ -3058,7 +3514,7 @@ impl ChessterEscrow {
             Self::settle_match(&env, &coordinator, &game_code, &mut m, None);
 
             env.events().publish(
-                (symbol_short!("resolved"), game_code.clone()),
+                (Symbol::new(&env, "v1"), symbol_short!("resolved"), game_code.clone()),
                 MatchResolvedEvent {
                     game_code: game_code.clone(),
                     winner: None,
@@ -3231,7 +3687,7 @@ impl ChessterEscrow {
         );
 
         env.events().publish(
-            (symbol_short!("timeout"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("timeout"), game_code.clone()),
             MatchTimeoutClaimedEvent {
                 game_code,
                 claimant,
@@ -3268,7 +3724,7 @@ impl ChessterEscrow {
         Self::settle_match(&env, &coordinator, &game_code, &mut m, Some(winner.clone()));
 
         env.events().publish(
-            (symbol_short!("forfeited"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("forfeited"), game_code.clone()),
             MatchForfeitedEvent {
                 game_code,
                 forfeiting_player,
@@ -3308,7 +3764,7 @@ impl ChessterEscrow {
         Self::execute_emergency_refund(&env, &game_code, &mut m);
 
         env.events().publish(
-            (symbol_short!("emer_ref"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("emer_ref"), game_code.clone()),
             MatchEmergencyRefundedEvent { game_code, caller },
         );
     }
@@ -3485,7 +3941,7 @@ impl ChessterEscrow {
 
     fn emit_milestone_event(env: &Env, player: Address, streak_count: u32, milestone_type: Symbol) {
         env.events().publish(
-            (symbol_short!("milestone"), player.clone()),
+            (Symbol::new(env, "v1"), symbol_short!("milestone"), player.clone()),
             (streak_count, milestone_type),
         );
     }
@@ -3710,7 +4166,7 @@ impl ChessterEscrow {
 
         let count = game_codes.len();
         env.events().publish(
-            (Symbol::new(&env, "batch_refunded"),),
+            (Symbol::new(&env, "v1"), Symbol::new(&env, "batch_refunded"),),
             BatchRefundedEvent { count, game_codes },
         );
         count
@@ -3781,7 +4237,7 @@ impl ChessterEscrow {
         Self::execute_refund(&env, &game_code, &mut m);
 
         env.events().publish(
-            (symbol_short!("autoref"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("autoref"), game_code.clone()),
             MatchAutoRefunded {
                 game_code,
                 player1,
@@ -3908,7 +4364,7 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &sp_key);
 
             env.events().publish(
-                (symbol_short!("funded"), game_code.clone()),
+                (Symbol::new(&env, "v1"), symbol_short!("funded"), game_code.clone()),
                 MatchFundedEvent {
                     game_code: game_code.clone(),
                     player2: player.clone(),
@@ -3917,7 +4373,7 @@ impl ChessterEscrow {
             );
 
             env.events().publish(
-                (symbol_short!("spons"), game_code.clone()),
+                (Symbol::new(&env, "v1"), symbol_short!("spons"), game_code.clone()),
                 SponsoredDepositEvent {
                     game_code,
                     player,
@@ -4014,7 +4470,7 @@ impl ChessterEscrow {
             Self::bump_entry_ttl(&env, &sp_key);
 
             env.events().publish(
-                (symbol_short!("created"), game_code.clone()),
+                (Symbol::new(&env, "v1"), symbol_short!("created"), game_code.clone()),
                 MatchCreatedEvent {
                     game_code: game_code.clone(),
                     player1: player.clone(),
@@ -4024,7 +4480,7 @@ impl ChessterEscrow {
             );
 
             env.events().publish(
-                (symbol_short!("spons"), game_code.clone()),
+                (Symbol::new(&env, "v1"), symbol_short!("spons"), game_code.clone()),
                 SponsoredDepositEvent {
                     game_code,
                     player,
@@ -4112,7 +4568,7 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &game_code);
 
         env.events().publish(
-            (symbol_short!("mut_canc"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("mut_canc"), game_code.clone()),
             MatchMutualCancelled {
                 game_code,
                 proposed_by: proposer,
@@ -4204,13 +4660,13 @@ impl ChessterEscrow {
             (None::<Address>, m.total_staked, 0_i128).into_val(env),
         );
         env.events().publish(
-            (symbol_short!("refunded"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("refunded"), game_code.clone()),
             MatchRefundedEvent {
                 game_code: game_code.clone(),
             },
         );
         env.events().publish(
-            (symbol_short!("expired"), game_code.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("expired"), game_code.clone()),
             MatchExpiredEvent {
                 game_code: game_code.clone(),
             },
@@ -4592,7 +5048,7 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &tournament_id);
 
         env.events().publish(
-            (symbol_short!("tourn_crt"), tournament_id),
+            (Symbol::new(&env, "v1"), symbol_short!("tourn_crt"), tournament_id),
             (buy_in_amount, effective_max, effective_min),
         );
     }
@@ -4665,7 +5121,7 @@ impl ChessterEscrow {
         Self::assert_balance_invariant(&env, &tournament.token);
 
         env.events().publish(
-            (symbol_short!("tourn_jn"), tournament_id, player),
+            (Symbol::new(&env, "v1"), symbol_short!("tourn_jn"), tournament_id, player),
             tournament.total_pool,
         );
     }
@@ -4746,7 +5202,7 @@ impl ChessterEscrow {
                 }
             }
         }
-        let (net_pool, rake) = Self::calculate_tournament_rake(tournament.total_pool, fee_bps);
+        let (net_pool, rake) = Self::calculate_tournament_rake(&env, tournament.total_pool, fee_bps);
 
         tournament.status = TournamentStatus::Completed;
         tournament.final_rankings = winners.clone();
@@ -4760,15 +5216,37 @@ impl ChessterEscrow {
 
         let mut total_distributed: i128 = 0;
         let num_winners = winners.len();
+        let mut accumulated_residuals: i128 = 0;
+        
         for i in 0..num_winners {
             let winner = winners.get(i).unwrap();
             let bps = payout_bps.get(i).unwrap();
-            let payout = if i == num_winners - 1 {
-                net_pool.checked_sub(total_distributed).unwrap()
+            let (payout_base, residual) = if i == num_winners - 1 {
+                // Last winner gets the remainder to ensure total payout equals net_pool exactly
+                let final_payout = net_pool
+                    .checked_sub(total_distributed)
+                    .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
+                (final_payout, 0)
             } else {
-                mul_div_bps(net_pool, bps)
+                mul_div_bps(&env, net_pool, bps)
             };
-            total_distributed = total_distributed.checked_add(payout).unwrap();
+            
+            // Apply accumulated residuals to first place winner (Issue #484)
+            let payout = if i == 0 {
+                payout_base.checked_add(accumulated_residuals)
+                    .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow))
+            } else {
+                payout_base
+            };
+            
+            total_distributed = total_distributed
+                .checked_add(payout)
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
+            
+            // Accumulate residuals from this prize tier
+            accumulated_residuals = accumulated_residuals
+                .checked_add(residual)
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
 
             if payout > 0 {
                 let is_disqualified = tournament.disqualified.get(winner.clone()).unwrap_or(false);
@@ -4782,7 +5260,9 @@ impl ChessterEscrow {
             }
         }
 
-        let total_out = total_distributed.checked_add(rake).unwrap();
+        let total_out = total_distributed
+            .checked_add(rake)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ArithmeticOverflow));
         if total_out != tournament.total_pool {
             panic_with_error!(&env, EscrowError::InvariantViolated);
         }
@@ -4791,7 +5271,7 @@ impl ChessterEscrow {
         Self::assert_balance_invariant(&env, &tournament.token);
 
         env.events().publish(
-            (symbol_short!("tourn_cmp"), tournament_id),
+            (Symbol::new(&env, "v1"), symbol_short!("tourn_cmp"), tournament_id),
             (winners, tournament.total_pool, rake),
         );
     }
@@ -4829,7 +5309,7 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &tournament_id);
 
         env.events().publish(
-            (symbol_short!("tourn_can"), tournament_id),
+            (Symbol::new(&env, "v1"), symbol_short!("tourn_can"), tournament_id),
             tournament.players.len(),
         );
     }
@@ -4887,7 +5367,7 @@ impl ChessterEscrow {
         Self::assert_balance_invariant(&env, &tournament.token);
 
         env.events().publish(
-            (symbol_short!("tourn_ref"), tournament_id, player),
+            (Symbol::new(&env, "v1"), symbol_short!("tourn_ref"), tournament_id, player),
             tournament.buy_in_amount,
         );
     }
@@ -4925,7 +5405,7 @@ impl ChessterEscrow {
         Self::bump_entry_ttl(&env, &tournament_id);
 
         env.events().publish(
-            (symbol_short!("tourn_dq"), tournament_id),
+            (Symbol::new(&env, "v1"), symbol_short!("tourn_dq"), tournament_id),
             (player, reason_code),
         );
     }
@@ -4989,7 +5469,7 @@ impl ChessterEscrow {
             STORAGE_TTL_EXTENDED,
         );
         env.events().publish(
-            (symbol_short!("elo_r"), player.clone()),
+            (Symbol::new(&env, "v1"), symbol_short!("elo_r"), player.clone()),
             PlayerEloUpdatedEvent { player, new_elo },
         );
     }
